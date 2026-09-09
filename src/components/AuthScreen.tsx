@@ -11,6 +11,10 @@ import { provisionEmployeeWorkspace } from '../lib/workspaceProvisioner';
 import {
   ShieldCheck,
   User,
+  Lock,
+  Eye,
+  EyeOff,
+  KeyRound,
   CheckCircle2,
   AlertCircle,
   ArrowRight,
@@ -34,6 +38,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   // Form states
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [adminPassword, setAdminPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [statusNotice, setStatusNotice] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -43,15 +51,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     setMode(newMode);
     setErrorMsg('');
     setStatusNotice('');
+    setPassword('');
+    setConfirmPassword('');
+    setShowPassword(false);
+    setAdminPassword('');
   };
 
   // ADMIN LOGIN
-  const handleAdminLogin = async (overrideEmail?: string) => {
+  const handleAdminLogin = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setErrorMsg('');
-    const targetEmail = (overrideEmail || email).trim().toLowerCase();
+    const targetEmail = (email || 'henishcodestrokes@gmail.com').trim().toLowerCase();
 
     if (!targetEmail) {
       setErrorMsg('Please enter your admin email address.');
+      return;
+    }
+
+    if (!adminPassword) {
+      setErrorMsg('Please enter your admin password.');
       return;
     }
 
@@ -64,6 +82,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
         id: 'admin-master',
         name: 'Henish (Main Admin)',
         email: 'henishcodestrokes@gmail.com',
+        password: 'admin123',
         role: 'admin',
         approved: true,
         createdAt: new Date().toISOString(),
@@ -79,21 +98,32 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       return;
     }
 
+    const expectedAdminPassword = admin.password || 'admin123';
+    if (adminPassword !== expectedAdminPassword) {
+      setErrorMsg('Incorrect admin password. Please try again.');
+      return;
+    }
+
     admin.lastActive = new Date().toISOString();
     syncUserToFirestore(admin);
     setActiveSessionUser(admin);
     onLoginSuccess(admin);
   };
 
-  // EMPLOYEE LOGIN - DIRECT (NO VERIFICATION CODE)
-  const handleEmployeeLogin = async (e?: React.FormEvent, overrideEmail?: string) => {
+  // EMPLOYEE LOGIN - STRICT PASSWORD VERIFICATION
+  const handleEmployeeLogin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     setErrorMsg('');
     setStatusNotice('');
 
-    const targetEmail = (overrideEmail || email).trim().toLowerCase();
+    const targetEmail = email.trim().toLowerCase();
     if (!targetEmail) {
       setErrorMsg('Please enter your employee email address.');
+      return;
+    }
+
+    if (!password) {
+      setErrorMsg('Password is required. Please enter your password to log in.');
       return;
     }
 
@@ -103,15 +133,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     );
 
     if (!employee) {
-      setErrorMsg('No employee account found with this email. Please sign up below or check your email.');
+      setErrorMsg('No employee account found with this email. Please sign up first via New Staff Sign-Up.');
+      return;
+    }
+
+    // Strict password verification
+    const expectedPassword = employee.password || '123456';
+    if (password !== expectedPassword) {
+      setErrorMsg('Incorrect password. Please verify your credentials and try again.');
       return;
     }
 
     setIsSubmitting(true);
-    setStatusNotice('Authenticating and preparing employee Drive folder & Sheet tab...');
+    setStatusNotice('Authenticating employee and checking workstation...');
 
     try {
-      // Auto-approve account directly (no verification code required)
+      // Auto-approve account directly
       employee.approved = true;
       employee.lastActive = new Date().toISOString();
       setActiveSessionUser(employee);
@@ -144,7 +181,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     }
   };
 
-  // EMPLOYEE SIGN UP - DIRECT (NO VERIFICATION CODE)
+  // EMPLOYEE SIGN UP - WITH PASSWORD CREATION
   const handleDirectEmployeeSignup = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
@@ -155,24 +192,40 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       return;
     }
 
+    if (!password) {
+      setErrorMsg('Please create a password for your account.');
+      return;
+    }
+
+    if (password.length < 4) {
+      setErrorMsg('Password must be at least 4 characters long.');
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setErrorMsg('Passwords do not match. Please verify your password confirmation.');
+      return;
+    }
+
     const users = getStoredUsers();
     const existing = users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
     if (existing) {
-      setErrorMsg('An account with this email already exists. Please log in directly.');
+      setErrorMsg('An account with this email already exists. Please log in with your password.');
       return;
     }
 
     setIsSubmitting(true);
-    setStatusNotice('Creating employee account...');
+    setStatusNotice('Creating employee account and securing credentials...');
 
     try {
-      // Create approved employee immediately!
+      // Create approved employee with password!
       const newEmployee: AppUser = {
         id: `emp-${Date.now()}`,
         name: name.trim(),
         email: email.trim().toLowerCase(),
+        password: password,
         role: 'employee',
-        approved: true, // Directly approved, no confirmation code needed
+        approved: true,
         createdAt: new Date().toISOString(),
         lastActive: new Date().toISOString(),
       };
@@ -217,8 +270,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     }
   };
 
-  const storedUsers = getStoredUsers();
-  const existingEmployees = storedUsers.filter((u) => u.role === 'employee');
   const storageSettings = getStorageSettings();
   const isDriveConfigured = Boolean(storageSettings.adminAccessToken);
 
@@ -318,7 +369,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
           </div>
         )}
 
-        {/* MODE 1: EMPLOYEE LOGIN (Direct, No Code) */}
+        {/* MODE 1: EMPLOYEE LOGIN (Requires Email and Password) */}
         {mode === 'employee_login' && (
           <form onSubmit={handleEmployeeLogin} className="space-y-4">
             <div className="space-y-1.5">
@@ -331,11 +382,39 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="e.g. alex.rivera@team.internal"
+                  placeholder="e.g. david.miller@company.com"
                   required
                   className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
                 <User className="w-4 h-4 text-slate-400 absolute right-3.5 top-3.5" />
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                  Password
+                </label>
+                <span className="text-[11px] text-slate-400">Required for access</span>
+              </div>
+              <div className="relative">
+                <input
+                  id="employee-login-password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Enter your personal account password"
+                  required
+                  className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                  tabIndex={-1}
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
 
@@ -357,43 +436,25 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               )}
             </button>
 
-            {/* Quick 1-Click Employee Buttons for Fast Testing on Any Machine */}
-            {existingEmployees.length > 0 && (
-              <div className="pt-3 border-t border-slate-100 dark:border-slate-800">
-                <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-2 flex items-center justify-between">
-                  <span>Quick Test Accounts:</span>
-                  <span className="text-[10px] text-emerald-600 font-normal">Click to test instantly</span>
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {existingEmployees.slice(0, 4).map((emp) => (
-                    <button
-                      key={emp.id}
-                      type="button"
-                      onClick={() => {
-                        setEmail(emp.email);
-                        handleEmployeeLogin(undefined, emp.email);
-                      }}
-                      className="p-2 border border-slate-200 dark:border-slate-700 hover:border-indigo-500 bg-slate-50 dark:bg-slate-800 rounded-xl text-left transition text-xs group cursor-pointer"
-                    >
-                      <div className="font-bold text-slate-800 dark:text-white group-hover:text-indigo-600 truncate">
-                        {emp.name}
-                      </div>
-                      <div className="text-[10px] text-slate-500 truncate">{emp.email}</div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            <div className="text-center pt-2">
+              <button
+                type="button"
+                onClick={() => handleSwitchMode('employee_signup')}
+                className="text-xs text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
+              >
+                New employee on this PC? Create your account & password →
+              </button>
+            </div>
           </form>
         )}
 
-        {/* MODE 2: EMPLOYEE SIGN-UP (Direct, Auto-Approved, No Code Required) */}
+        {/* MODE 2: EMPLOYEE SIGN-UP (Name, Email, Password, Confirm Password) */}
         {mode === 'employee_signup' && (
           <form onSubmit={handleDirectEmployeeSignup} className="space-y-4">
             <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-3 rounded-xl text-emerald-900 dark:text-emerald-200 text-xs flex items-start gap-2">
               <Sparkles className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
               <div>
-                <strong>Direct Registration Active:</strong> Enter your name and email to immediately begin work. A dedicated Drive folder and Sheet tab will be automatically generated for you.
+                <strong>Personal Account Setup:</strong> Create your secure credentials. A dedicated Google Drive folder and Sheet tab will be prepared for your desktop activity.
               </div>
             </div>
 
@@ -427,6 +488,47 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               />
             </div>
 
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                Create Account Password
+              </label>
+              <div className="relative">
+                <input
+                  id="signup-password-input"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Minimum 4 characters"
+                  required
+                  minLength={4}
+                  className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                  tabIndex={-1}
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                Confirm Password
+              </label>
+              <input
+                id="signup-confirm-password-input"
+                type={showPassword ? 'text' : 'password'}
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                placeholder="Re-enter your password"
+                required
+                className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+
             <button
               type="submit"
               disabled={isSubmitting}
@@ -444,12 +546,22 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
                 </>
               )}
             </button>
+
+            <div className="text-center pt-2">
+              <button
+                type="button"
+                onClick={() => handleSwitchMode('employee_login')}
+                className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 cursor-pointer"
+              >
+                Already have an account? Sign in here →
+              </button>
+            </div>
           </form>
         )}
 
         {/* MODE 3: ADMIN LOGIN */}
         {mode === 'admin_login' && (
-          <div className="space-y-4">
+          <form onSubmit={handleAdminLogin} className="space-y-4">
             <div className="bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 p-3.5 rounded-xl text-indigo-900 dark:text-indigo-200 text-xs space-y-1">
               <div className="font-bold flex items-center gap-1.5">
                 <ShieldCheck className="w-4 h-4 text-indigo-600" />
@@ -470,19 +582,47 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
                 value={email || 'henishcodestrokes@gmail.com'}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="henishcodestrokes@gmail.com"
+                required
                 className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white font-mono"
               />
             </div>
 
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                Admin Master Password
+              </label>
+              <div className="relative">
+                <input
+                  id="admin-login-password"
+                  type={showPassword ? 'text' : 'password'}
+                  value={adminPassword}
+                  onChange={(e) => setAdminPassword(e.target.value)}
+                  placeholder="Enter admin password (default: admin123)"
+                  required
+                  className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                  tabIndex={-1}
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <div className="text-[11px] text-slate-400">
+                Default master password: <code className="text-indigo-600 font-semibold">admin123</code>
+              </div>
+            </div>
+
             <button
-              type="button"
-              onClick={() => handleAdminLogin(email || 'henishcodestrokes@gmail.com')}
+              type="submit"
               className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition shadow-md flex items-center justify-center gap-2 cursor-pointer"
             >
               <ShieldCheck className="w-4 h-4" />
               <span>Enter Admin Dashboard</span>
             </button>
-          </div>
+          </form>
         )}
       </div>
     </div>

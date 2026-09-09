@@ -9,6 +9,7 @@ export const DEFAULT_ADMIN: AppUser = {
   id: 'admin-master',
   name: 'Henish (Main Admin)',
   email: 'henishcodestrokes@gmail.com',
+  password: 'admin123',
   role: 'admin',
   approved: true,
   createdAt: '2026-09-01T08:00:00.000Z',
@@ -20,6 +21,7 @@ export const DEFAULT_EMPLOYEES: AppUser[] = [
     id: 'emp-101',
     name: 'Alex Rivera',
     email: 'alex.rivera@team.internal',
+    password: 'password123',
     role: 'employee',
     approved: true,
     createdAt: '2026-09-02T09:00:00.000Z',
@@ -29,6 +31,7 @@ export const DEFAULT_EMPLOYEES: AppUser[] = [
     id: 'emp-102',
     name: 'Sarah Chen',
     email: 'sarah.chen@team.internal',
+    password: 'password123',
     role: 'employee',
     approved: true,
     createdAt: '2026-09-03T09:30:00.000Z',
@@ -55,7 +58,11 @@ export function getStoredUsers(): AppUser[] {
       localStorage.setItem(USERS_KEY, JSON.stringify(initial));
       return initial;
     }
-    return JSON.parse(raw);
+    const parsed: AppUser[] = JSON.parse(raw);
+    return parsed.map((u) => ({
+      ...u,
+      password: u.password || (u.role === 'admin' ? 'admin123' : '123456'),
+    }));
   } catch {
     return [DEFAULT_ADMIN, ...DEFAULT_EMPLOYEES];
   }

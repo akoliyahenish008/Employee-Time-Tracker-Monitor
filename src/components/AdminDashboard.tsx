@@ -21,7 +21,9 @@ import {
   Calendar,
   Shuffle,
   Mail,
-  Folder
+  Folder,
+  Terminal,
+  Monitor
 } from 'lucide-react';
 import { formatSecondsToHoursMinutes, secondsToDecimalHours } from '../lib/utils';
 import { provisionEmployeeWorkspace, verifyGoogleAccessToken } from '../lib/workspaceProvisioner';
@@ -881,13 +883,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            <div className="pt-3">
+            <div className="pt-3 flex items-center justify-between">
               <button
                 onClick={handleSaveSettings}
                 className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-5 py-2.5 rounded-xl transition shadow cursor-pointer"
               >
                 Save Storage Location & Configuration
               </button>
+            </div>
+
+            {/* Corporate Employee PC Silent Deployment Guide (No Popups & Direct Full Screen) */}
+            <div className="mt-6 pt-6 border-t border-slate-200 dark:border-slate-800 space-y-3">
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <Terminal className="w-4 h-4 text-indigo-600" />
+                <span>Corporate PC Silent Deployment (Remove Popups & Bypasses Tab/Window Picker)</span>
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                To run WorkMonitor on company employee PCs with <strong>zero dialogs</strong> (no "Chrome Tab" or "Window" selection) and <strong>completely suppress the "Stop sharing" popup</strong>, launch Chrome using the command below or configure the Chrome GPO policy:
+              </p>
+
+              <div className="p-3 bg-slate-950 text-emerald-400 font-mono text-xs rounded-xl overflow-x-auto select-all">
+                chrome.exe --auto-select-desktop-capture-source="Entire screen" --enable-usermedia-screen-capturing --app="{window.location.href}"
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 text-xs">
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200 block mb-1">
+                    🚀 Standard Browser 1-Click:
+                  </span>
+                  <p className="text-slate-500 text-[11px]">
+                    Employees can simply click the native <strong>[Hide]</strong> button on the Chrome bottom bar to instantly minimize the popup for the rest of their work shift.
+                  </p>
+                </div>
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200 block mb-1">
+                    🏢 Group Policy (GPO / Registry):
+                  </span>
+                  <p className="text-slate-500 text-[11px]">
+                    Set Chrome policy <code className="text-indigo-600 dark:text-indigo-400 font-mono">AutoSelectDesktopCaptureSource=["Entire screen"]</code> to auto-capture monitors silently on all domain computers.
+                  </p>
+                </div>
+              </div>
             </div>
           </div>
         </div>

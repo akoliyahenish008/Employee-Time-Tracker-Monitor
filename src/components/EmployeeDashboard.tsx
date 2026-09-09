@@ -17,7 +17,15 @@ import {
   Activity,
   Monitor,
   Shuffle,
-  HardDrive
+  HardDrive,
+  Bell,
+  BellRing,
+  Volume2,
+  VolumeX,
+  X,
+  Info,
+  HelpCircle,
+  Terminal
 } from 'lucide-react';
 import {
   formatSecondsToHoursMinutes,
@@ -78,6 +86,108 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const [lastCapturedTimeStr, setLastCapturedTimeStr] = useState<string>('');
   const [workspaceStatus, setWorkspaceStatus] = useState<string>('');
   const [isProvisioning, setIsProvisioning] = useState<boolean>(false);
+
+  // Capture Notification States & Preferences
+  const [activeCaptureNotice, setActiveCaptureNotice] = useState<ScreenshotLog | null>(null);
+  const [soundAlerts, setSoundAlerts] = useState<boolean>(() => {
+    return localStorage.getItem('wm_sound_alerts') !== 'false';
+  });
+  const [desktopAlerts, setDesktopAlerts] = useState<boolean>(() => {
+    return (
+      localStorage.getItem('wm_desktop_alerts') === 'true' &&
+      typeof window !== 'undefined' &&
+      'Notification' in window &&
+      Notification.permission === 'granted'
+    );
+  });
+  const [showNotificationSettings, setShowNotificationSettings] = useState<boolean>(false);
+  const [showHidePopupTip, setShowHidePopupTip] = useState<boolean>(false);
+  const [showSilentGuideModal, setShowSilentGuideModal] = useState<boolean>(false);
+
+  // Audio synthesis chime for subtle audio feedback when screenshot is taken
+  const playCaptureChime = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+      osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1); // A5
+      gain.gain.setValueAtTime(0.08, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.22);
+    } catch {}
+  };
+
+  // Trigger rich in-app toast, audio chime, and optional desktop notification
+  const triggerCaptureNotification = (log: ScreenshotLog) => {
+    setActiveCaptureNotice(log);
+
+    // Auto-dismiss floating notification after 6 seconds
+    setTimeout(() => {
+      setActiveCaptureNotice((curr) => (curr?.id === log.id ? null : curr));
+    }, 6000);
+
+    // Audio alert
+    if (soundAlerts) {
+      playCaptureChime();
+    }
+
+    // HTML5 native desktop notification
+    if (
+      desktopAlerts &&
+      typeof window !== 'undefined' &&
+      'Notification' in window &&
+      Notification.permission === 'granted'
+    ) {
+      try {
+        new Notification('📸 WorkMonitor: Screen Captured', {
+          body: `Snapshot recorded at ${log.timeFormatted} for "${log.taskName}". Synced to Google Drive.`,
+          icon: log.previewDataUrl,
+        });
+      } catch (e) {
+        console.warn('Desktop notification notice:', e);
+      }
+    }
+  };
+
+  const toggleSoundAlerts = () => {
+    const next = !soundAlerts;
+    setSoundAlerts(next);
+    localStorage.setItem('wm_sound_alerts', String(next));
+    if (next) playCaptureChime();
+  };
+
+  const toggleDesktopAlerts = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      alert('Desktop notifications are not supported in this browser.');
+      return;
+    }
+
+    if (Notification.permission === 'granted') {
+      const next = !desktopAlerts;
+      setDesktopAlerts(next);
+      localStorage.setItem('wm_desktop_alerts', String(next));
+    } else if (Notification.permission !== 'denied') {
+      const perm = await Notification.requestPermission();
+      if (perm === 'granted') {
+        setDesktopAlerts(true);
+        localStorage.setItem('wm_desktop_alerts', 'true');
+        try {
+          new Notification('WorkMonitor Alerts Enabled', {
+            body: 'You will receive notifications whenever a screen capture is taken.',
+          });
+        } catch {}
+      }
+    } else {
+      alert('Desktop notifications are blocked by browser settings. Please permit notifications in your browser address bar.');
+    }
+  };
 
   // Screen capture references
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -170,25 +280,57 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   }, []);
 
   // Request actual entire computer screen capture using getDisplayMedia
+  // Pre-selects Entire Screen ("monitor") and excludes Chrome Tab & Window options
   const initScreenStream = async (): Promise<MediaStream | null> => {
     try {
       if (screenStreamRef.current && screenStreamRef.current.active) {
         return screenStreamRef.current;
       }
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          displaySurface: 'monitor', // request entire monitor
-        },
-        audio: false,
-      });
+
+      let stream: MediaStream;
+      try {
+        // Enforce Entire Screen ("monitor") and exclude Chrome Tab & Window options
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'monitor', // Pre-select Entire Screen tab
+            width: { ideal: 1920, max: 3840 },
+            height: { ideal: 1080, max: 2160 },
+            frameRate: { ideal: 5, max: 15 },
+          },
+          audio: false,
+          monitorTypeSurfaces: 'include', // Include physical screens
+          selfBrowserSurface: 'exclude',   // Exclude "Chrome Tab"
+          surfaceSwitching: 'exclude',     // Exclude dynamic switching
+          systemAudio: 'exclude',
+          preferCurrentTab: false,
+        } as any);
+      } catch (advancedErr) {
+        console.warn('Advanced display constraints fallback:', advancedErr);
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'monitor',
+          },
+          audio: false,
+        });
+      }
 
       // Handle user stopping screen share from browser banner
-      stream.getVideoTracks()[0].onended = () => {
-        setLastSyncStatus('Screen sharing stopped by user');
-        screenStreamRef.current = null;
-      };
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        // Warn if non-monitor surface was selected
+        const settings = videoTrack.getSettings ? (videoTrack.getSettings() as any) : null;
+        if (settings?.displaySurface && settings.displaySurface !== 'monitor') {
+          setLastSyncStatus('⚠️ Notice: You selected a single window/tab. For full monitoring, choose "Entire Screen".');
+        }
+
+        videoTrack.onended = () => {
+          setLastSyncStatus('Screen sharing stopped. Click "Resume" to restart whole-screen tracking.');
+          screenStreamRef.current = null;
+        };
+      }
 
       screenStreamRef.current = stream;
+      setShowHidePopupTip(true);
       return stream;
     } catch (err: any) {
       console.error('Screen capture permission error:', err);
@@ -371,6 +513,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       setLastCapturedTimeStr(timeFormatted);
       onNewScreenshot(newLog);
       await logScreenshotToFirestore(newLog);
+
+      // Trigger capture notification (toast, chime, desktop alert)
+      triggerCaptureNotification(newLog);
     } catch (err: any) {
       console.error('Screenshot error:', err);
       setLastSyncStatus(`Capture warning: ${err.message}`);
@@ -765,6 +910,84 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
             </div>
 
             <div className="flex items-center gap-2">
+              {/* Notification Preferences Popover Button */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowNotificationSettings(!showNotificationSettings)}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition cursor-pointer ${
+                    soundAlerts || desktopAlerts
+                      ? 'border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300'
+                      : 'border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-500'
+                  }`}
+                  title="Configure Screen Capture Notifications"
+                >
+                  <Bell className="w-3.5 h-3.5" />
+                  <span>Alerts: {soundAlerts && desktopAlerts ? 'Sound + Desktop' : soundAlerts ? 'Chime Active' : desktopAlerts ? 'Desktop Active' : 'Muted'}</span>
+                </button>
+
+                {showNotificationSettings && (
+                  <div className="absolute right-0 bottom-full mb-2 w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3.5 shadow-2xl z-40 space-y-3">
+                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+                      <span className="text-xs font-bold text-slate-800 dark:text-white flex items-center gap-1.5">
+                        <BellRing className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Capture Alerts</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowNotificationSettings(false)}
+                        className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-xs p-1 cursor-pointer"
+                      >
+                        ✕
+                      </button>
+                    </div>
+
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                          {soundAlerts ? <Volume2 className="w-3.5 h-3.5 text-emerald-600" /> : <VolumeX className="w-3.5 h-3.5 text-slate-400" />}
+                          <span>Audio chime on capture</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={toggleSoundAlerts}
+                          className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
+                            soundAlerts
+                              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                          }`}
+                        >
+                          {soundAlerts ? 'ON' : 'OFF'}
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                          <Monitor className="w-3.5 h-3.5 text-indigo-600" />
+                          <span>Desktop browser notification</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={toggleDesktopAlerts}
+                          className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
+                            desktopAlerts
+                              ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300'
+                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                          }`}
+                        >
+                          {desktopAlerts ? 'ON' : 'ENABLE'}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px] text-slate-500">
+                      <span>In-app visual toast</span>
+                      <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Active</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={() => handleProvisionWorkspace(true)}
@@ -783,6 +1006,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               <span>{workspaceStatus}</span>
             </div>
           )}
+
+          {/* Whole Screen Active Guidance & Stop Sharing Removal Guide */}
+          <div className="p-3 bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2 text-indigo-900 dark:text-indigo-200">
+              <Monitor className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+              <span>
+                <strong>Whole-Screen Capture:</strong> To hide the Chrome <em>"sharing your screen"</em> popup bar, click the <strong>[Hide]</strong> button right next to "Stop sharing".
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-sm transition cursor-pointer"
+              >
+                <Terminal className="w-3.5 h-3.5" />
+                <span>Remove Popups & Silent PC Setup</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -960,6 +1204,160 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <span>Open in Admin Google Drive</span>
                 </a>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Screenshot Capture Notification Toast */}
+      {activeCaptureNotice && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-sm w-full animate-in fade-in slide-in-from-bottom-4 duration-300">
+          <div className="bg-slate-900/95 text-white rounded-2xl shadow-2xl border border-indigo-500/50 p-4 flex items-start gap-3.5 backdrop-blur-md">
+            <div
+              className="w-14 h-14 shrink-0 rounded-xl overflow-hidden border border-slate-700 bg-black cursor-pointer group relative shadow-inner"
+              onClick={() => setPreviewModal(activeCaptureNotice)}
+              title="Click to expand screenshot preview"
+            >
+              <img
+                src={activeCaptureNotice.previewDataUrl}
+                alt="Capture preview"
+                className="w-full h-full object-cover transition duration-300 group-hover:scale-110"
+              />
+              <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition flex items-center justify-center">
+                <Camera className="w-4 h-4 text-white drop-shadow" />
+              </div>
+            </div>
+
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-400">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                  <span>Screenshot Captured!</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveCaptureNotice(null)}
+                  className="text-slate-400 hover:text-white p-0.5 cursor-pointer rounded"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="text-xs text-slate-100 font-semibold truncate mt-1">
+                {activeCaptureNotice.taskName}
+              </div>
+
+              <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+                <span>{activeCaptureNotice.timeFormatted} &bull; Synced</span>
+                <button
+                  type="button"
+                  onClick={() => setPreviewModal(activeCaptureNotice)}
+                  className="text-indigo-400 hover:text-indigo-300 font-semibold cursor-pointer underline"
+                >
+                  View Full Size
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Silent Enterprise Setup & Remove Popups Guide Modal */}
+      {showSilentGuideModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-800/60">
+              <div className="flex items-center gap-2">
+                <div className="p-2 bg-indigo-100 dark:bg-indigo-900/60 text-indigo-600 dark:text-indigo-300 rounded-xl">
+                  <Terminal className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Silent Whole-Screen Mode & Remove Popups
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    How to remove the "Stop sharing" popup and bypass tab/window pickers
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1.5 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto text-xs text-slate-600 dark:text-slate-300">
+              {/* Method 1 */}
+              <div className="p-4 rounded-xl border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/50 dark:bg-emerald-950/30 space-y-2">
+                <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>Instant 1-Click Method (No Installation Needed)</span>
+                </div>
+                <p className="leading-relaxed">
+                  When Chrome displays the bottom bar saying <em>"...is sharing your screen. [Stop sharing] [Hide]"</em>:
+                </p>
+                <div className="bg-white dark:bg-slate-900 p-3 rounded-lg border border-emerald-200 dark:border-emerald-800 flex items-center justify-between">
+                  <span className="font-medium text-slate-800 dark:text-slate-200">
+                    Click the <strong>[Hide]</strong> button right next to Stop Sharing.
+                  </span>
+                  <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 rounded font-bold text-[11px]">
+                    Hides Bar Instantly
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Chrome will immediately minimize the bar off the screen while maintaining continuous background screenshot captures.
+                </p>
+              </div>
+
+              {/* Method 2 */}
+              <div className="p-4 rounded-xl border border-indigo-200 dark:border-indigo-800/60 bg-indigo-50/50 dark:bg-indigo-950/30 space-y-3">
+                <div className="flex items-center gap-2 text-indigo-800 dark:text-indigo-300 font-bold text-sm">
+                  <Monitor className="w-4 h-4 text-indigo-600" />
+                  <span>Corporate Silent Mode (Bypasses Picker Dialog & Removes Popup Completely)</span>
+                </div>
+                <p className="leading-relaxed">
+                  For employee PCs and office workstations where employee monitoring is mandated, you can launch Chrome in Enterprise Silent Mode. This completely skips the picker dialog (no tabs/windows) and completely suppresses the "stop sharing" bar:
+                </p>
+
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">
+                    Windows Run Shortcut (or Startup Batch):
+                  </div>
+                  <div className="p-2.5 bg-slate-950 text-emerald-400 font-mono text-[11px] rounded-lg overflow-x-auto select-all">
+                    chrome.exe --auto-select-desktop-capture-source="Entire screen" --enable-usermedia-screen-capturing --app="{window.location.href}"
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">
+                    Google Chrome Enterprise Policy (GPO / Registry for All Office PCs):
+                  </div>
+                  <div className="p-2.5 bg-slate-950 text-slate-200 font-mono text-[11px] rounded-lg overflow-x-auto">
+                    Registry Path: HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome<br />
+                    Value Name: AutoSelectDesktopCaptureSource<br />
+                    Value Data (JSON String): ["Entire screen"]
+                  </div>
+                </div>
+
+                <ul className="list-disc pl-5 space-y-1 text-[11px] text-slate-500">
+                  <li><strong>Zero Dialogs:</strong> Never shows "Chrome Tab" or "Window" options.</li>
+                  <li><strong>Zero Popups:</strong> Removes the "Stop sharing" warning completely.</li>
+                  <li><strong>100% Background:</strong> Captures the full desktop seamlessly for central Admin sync.</li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/60 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(false)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl text-xs transition cursor-pointer"
+              >
+                Got It, Close
+              </button>
             </div>
           </div>
         </div>
