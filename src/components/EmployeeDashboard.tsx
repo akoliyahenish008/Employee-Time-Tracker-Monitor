@@ -34,7 +34,10 @@ import {
 import {
   getOrCreateSpreadsheet,
   logTaskIntervalToSheet,
+  ensureSheetTab,
+  appendSheetRows,
 } from '../lib/sheetService';
+import { provisionEmployeeWorkspace } from '../lib/workspaceProvisioner';
 import { logScreenshotToFirestore } from '../lib/firebase';
 
 interface EmployeeDashboardProps {
@@ -67,9 +70,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const [selectedHourTab, setSelectedHourTab] = useState<string>('all');
   const [previewModal, setPreviewModal] = useState<ScreenshotLog | null>(null);
 
-  // Next randomized capture countdown and timestamp
+  // Next randomized or fixed capture countdown and timestamp
+  const [selectedInterval, setSelectedInterval] = useState<number | 'random'>(
+    storageSettings.captureIntervalSeconds || 10
+  );
   const [nextCaptureInSec, setNextCaptureInSec] = useState<number | null>(null);
   const [lastCapturedTimeStr, setLastCapturedTimeStr] = useState<string>('');
+  const [workspaceStatus, setWorkspaceStatus] = useState<string>('');
+  const [isProvisioning, setIsProvisioning] = useState<boolean>(false);
 
   // Screen capture references
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -79,6 +87,48 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
   // Effective token: Either employee's direct session token OR the central Admin's synced token
   const effectiveDriveToken = accessToken || storageSettings.adminAccessToken || null;
+
+  // Auto-verify or create Google Drive Folder & Sheet Tab on mount or when token updates
+  useEffect(() => {
+    if (effectiveDriveToken && currentUser) {
+      handleProvisionWorkspace(false);
+    }
+  }, [effectiveDriveToken, currentUser.id]);
+
+  const handleProvisionWorkspace = async (manualNotice: boolean = true) => {
+    const token = effectiveDriveToken;
+    if (!token) {
+      if (manualNotice) {
+        setWorkspaceStatus('Admin Google OAuth token not active yet. Admin can authorize in Admin Portal.');
+      }
+      return;
+    }
+
+    setIsProvisioning(true);
+    if (manualNotice) {
+      setWorkspaceStatus('Creating / Verifying Drive Folders & Master Sheet Tab...');
+    }
+
+    try {
+      const res = await provisionEmployeeWorkspace(
+        token,
+        currentUser,
+        storageSettings.spreadsheetName,
+        storageSettings.centralFolderName
+      );
+
+      if (res.success) {
+        setWorkspaceStatus(`✅ Google Drive folder & Sheet tab active for ${currentUser.name}!`);
+      } else {
+        setWorkspaceStatus(`Drive/Sheet notice: ${res.message}`);
+      }
+    } catch (err: any) {
+      console.warn('Workspace provisioning error:', err);
+      setWorkspaceStatus(`Setup notice: ${err.message}`);
+    } finally {
+      setIsProvisioning(false);
+    }
+  };
 
   // Keep track of tasks switched today
   const [taskHistory, setTaskHistory] = useState<
@@ -148,22 +198,22 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   };
 
   /**
-   * Helper to schedule the next random screenshot between 5 and 10 minutes (300 to 600 seconds)
-   * or based on fixed interval if selected by admin.
+   * Helper to schedule the next screenshot based on the selected interval:
+   * 10s, 20s, 1m (60s), 5m (300s), 10m (600s), 15m (900s), or random 5-10m
    */
-  const scheduleNextScreenshot = () => {
+  const scheduleNextScreenshot = (overrideInterval?: number | 'random') => {
     if (randomCaptureTimerRef.current) clearTimeout(randomCaptureTimerRef.current);
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
 
-    let delaySeconds = 420; // default 7 min
+    const activeInterval = overrideInterval !== undefined ? overrideInterval : selectedInterval;
 
-    if (storageSettings.captureMode === 'fixed_interval') {
-      delaySeconds = Math.max(1, storageSettings.autoCaptureIntervalMinutes || 7) * 60;
-    } else {
-      // Random between 5 minutes (300s) and 10 minutes (600s)
+    let delaySeconds = 10;
+    if (activeInterval === 'random') {
       const minSec = 300;
       const maxSec = 600;
       delaySeconds = Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
+    } else {
+      delaySeconds = Number(activeInterval) || 10;
     }
 
     setNextCaptureInSec(delaySeconds);
@@ -180,9 +230,16 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     randomCaptureTimerRef.current = window.setTimeout(async () => {
       if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       await captureAndUploadScreen();
-      // After capture, time and next random cycle resets!
-      scheduleNextScreenshot();
+      // After capture, reset and schedule next screenshot!
+      scheduleNextScreenshot(activeInterval);
     }, delaySeconds * 1000);
+  };
+
+  const handleIntervalChange = (newInterval: number | 'random') => {
+    setSelectedInterval(newInterval);
+    if (isTracking && !isPaused) {
+      scheduleNextScreenshot(newInterval);
+    }
   };
 
   /**
@@ -263,6 +320,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           driveWebLink = uploadRes.webViewLink;
           setDriveUploadCount((c) => c + 1);
           setLastSyncStatus(`Saved to Admin Drive (${storageSettings.centralAdminEmail}): ${fileName}`);
+
+          // Also immediately append screenshot event to employee's personal sheet tab
+          try {
+            const spreadsheetId = await getOrCreateSpreadsheet(uploadToken, storageSettings.spreadsheetName);
+            await ensureSheetTab(uploadToken, spreadsheetId, currentUser.name);
+            await appendSheetRows(uploadToken, spreadsheetId, currentUser.name, [
+              [
+                dateKey,
+                currentTask,
+                timeFormatted,
+                timeFormatted,
+                `Interval: ${typeof selectedInterval === 'number' ? `${selectedInterval}s` : 'random'}`,
+                0,
+                'Screenshot Captured',
+                1,
+                driveWebLink || fileName,
+              ],
+            ]);
+          } catch (sheetLogErr) {
+            console.warn('Sheet screenshot sync note:', sheetLogErr);
+          }
         } catch (uploadErr: any) {
           console.warn('Drive upload attempt warning:', uploadErr);
           setLastSyncStatus(`Drive upload warning: ${uploadErr.message}`);
@@ -557,15 +635,43 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               </div>
             </div>
 
-            {/* Live Sync Status Banner */}
-            <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2 pt-1">
-              <span>Status:</span>
-              <span className="font-semibold text-slate-700 dark:text-slate-300">{lastSyncStatus}</span>
-              {isTracking && nextCaptureInSec !== null && (
-                <span className="bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 px-2 py-0.5 rounded font-mono text-[11px] font-semibold">
-                  Next random capture in: ~{Math.floor(nextCaptureInSec / 60)}m {nextCaptureInSec % 60}s
-                </span>
-              )}
+            {/* Live Sync Status Banner & Interval Selector */}
+            <div className="space-y-2 pt-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Capture Interval:</span>
+                {[
+                  { label: '10 sec', val: 10 },
+                  { label: '20 sec', val: 20 },
+                  { label: '1 min', val: 60 },
+                  { label: '5 min', val: 300 },
+                  { label: '10 min', val: 600 },
+                  { label: '15 min', val: 900 },
+                  { label: 'Random (5–10m)', val: 'random' },
+                ].map((item) => (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => handleIntervalChange(item.val as any)}
+                    className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition cursor-pointer ${
+                      selectedInterval === item.val
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2">
+                <span>Status:</span>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">{lastSyncStatus}</span>
+                {isTracking && nextCaptureInSec !== null && (
+                  <span className="bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 px-2 py-0.5 rounded font-mono text-[11px] font-semibold animate-pulse">
+                    Next capture in: {nextCaptureInSec < 60 ? `${nextCaptureInSec}s` : `~${Math.floor(nextCaptureInSec / 60)}m ${nextCaptureInSec % 60}s`}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
 
@@ -646,23 +752,37 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           </div>
         </div>
 
-        {/* Central Storage Destination Bar */}
-        <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
-            <Monitor className="w-4 h-4 text-indigo-500" />
-            <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
-            <span>&bull;</span>
-            <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
-            <span>&bull;</span>
-            <span>Format: <strong className="uppercase font-mono">.{storageSettings.screenshotFormat}</strong></span>
+        {/* Central Storage Destination Bar & Workspace Verification */}
+        <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
+              <Monitor className="w-4 h-4 text-indigo-500" />
+              <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
+              <span>&bull;</span>
+              <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
+              <span>&bull;</span>
+              <span>Sheet Tab: <strong className="font-mono text-slate-800 dark:text-slate-200">[{currentUser.name}]</strong> in <strong className="text-slate-800 dark:text-slate-200">{storageSettings.spreadsheetName}</strong></span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleProvisionWorkspace(true)}
+                disabled={isProvisioning}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
+              >
+                <HardDrive className="w-3.5 h-3.5 text-indigo-500" />
+                <span>{isProvisioning ? 'Verifying...' : 'Check / Create Drive Folder & Sheet Tab'}</span>
+              </button>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-semibold bg-emerald-50 dark:bg-emerald-950/60 px-2.5 py-1 rounded-full border border-emerald-200 dark:border-emerald-800">
-              <HardDrive className="w-3.5 h-3.5" />
-              <span>Direct Admin Drive & Sheet Routing</span>
-            </span>
-          </div>
+          {workspaceStatus && (
+            <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 rounded-xl text-xs flex items-center gap-2 font-medium">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{workspaceStatus}</span>
+            </div>
+          )}
         </div>
       </div>
 

@@ -42,7 +42,8 @@ export const DEFAULT_STORAGE_SETTINGS: StorageSettings = {
   centralFolderName: 'WorkMonitor_Records',
   screenshotFormat: 'webp',
   autoCaptureIntervalMinutes: 7,
-  captureMode: 'random_5_to_10_min',
+  captureIntervalSeconds: 10,
+  captureMode: 'fixed_interval',
   spreadsheetName: 'Employee_Time_Tracking_Master',
 };
 

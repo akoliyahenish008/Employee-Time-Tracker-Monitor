@@ -90,7 +90,67 @@ export const initAuth = (
   });
 };
 
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+export const requestGoogleTokenViaGSI = (): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined') {
+      reject(new Error('Browser environment required.'));
+      return;
+    }
+
+    const gsi = (window as any).google?.accounts?.oauth2;
+    const clientId = firebaseConfig.oAuthClientId;
+
+    if (!gsi) {
+      reject(new Error('Google Identity Services is initializing. Please try again in 2 seconds.'));
+      return;
+    }
+
+    if (!clientId) {
+      reject(new Error('OAuth Client ID is missing in configuration.'));
+      return;
+    }
+
+    try {
+      const tokenClient = gsi.initTokenClient({
+        client_id: clientId,
+        scope: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets',
+        prompt: 'consent',
+        callback: (resp: any) => {
+          if (resp.error) {
+            reject(new Error(`OAuth error: ${resp.error_description || resp.error}`));
+            return;
+          }
+          if (resp.access_token) {
+            setCachedToken(resp.access_token);
+            resolve(resp.access_token);
+          } else {
+            reject(new Error('No access token returned by Google.'));
+          }
+        },
+        error_callback: (err: any) => {
+          reject(new Error(err.message || 'Google OAuth prompt closed or blocked.'));
+        },
+      });
+
+      tokenClient.requestAccessToken({ prompt: 'consent' });
+    } catch (err: any) {
+      reject(err);
+    }
+  });
+};
+
+export const googleSignIn = async (): Promise<{ user?: User; accessToken: string } | null> => {
+  // 1. First attempt Google Identity Services (fast, modern popup, avoids iframe domain blocks)
+  try {
+    const gsiToken = await requestGoogleTokenViaGSI();
+    if (gsiToken) {
+      return { accessToken: gsiToken };
+    }
+  } catch (gsiErr: any) {
+    console.warn('GSI token attempt note, trying Firebase popup fallback:', gsiErr.message);
+  }
+
+  // 2. Fallback to Firebase GoogleAuthProvider popup
   if (!auth || !provider) {
     throw new Error('Google Authentication is not configured or initialized.');
   }

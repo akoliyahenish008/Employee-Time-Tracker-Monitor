@@ -24,6 +24,7 @@ import {
   Folder
 } from 'lucide-react';
 import { formatSecondsToHoursMinutes, secondsToDecimalHours } from '../lib/utils';
+import { provisionEmployeeWorkspace, verifyGoogleAccessToken } from '../lib/workspaceProvisioner';
 
 interface AdminDashboardProps {
   adminUser: AppUser;
@@ -64,11 +65,19 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [folderName, setFolderName] = useState(storageSettings.centralFolderName || 'WorkMonitor_Records');
   const [screenFormat, setScreenFormat] = useState<'webp' | 'png' | 'jpg'>(storageSettings.screenshotFormat || 'webp');
   const [captureMode, setCaptureMode] = useState<'random_5_to_10_min' | 'fixed_interval'>(
-    storageSettings.captureMode || 'random_5_to_10_min'
+    storageSettings.captureMode || 'fixed_interval'
   );
   const [intervalMinutes, setIntervalMinutes] = useState<number>(storageSettings.autoCaptureIntervalMinutes || 7);
+  const [intervalSeconds, setIntervalSeconds] = useState<number>(storageSettings.captureIntervalSeconds || 10);
   const [sheetName, setSheetName] = useState(storageSettings.spreadsheetName || 'Employee_Time_Tracking_Master');
   const [savedSuccessMsg, setSavedSuccessMsg] = useState('');
+
+  // Batch provisioning & Token testing states
+  const [batchProvisionStatus, setBatchProvisionStatus] = useState<string>('');
+  const [isBatchProvisioning, setIsBatchProvisioning] = useState<boolean>(false);
+  const [manualTokenInput, setManualTokenInput] = useState<string>('');
+  const [tokenTestResult, setTokenTestResult] = useState<string>('');
+  const [isTestingToken, setIsTestingToken] = useState<boolean>(false);
 
   // Handle Save Settings
   const handleSaveSettings = () => {
@@ -79,13 +88,81 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       centralFolderName: folderName,
       screenshotFormat: screenFormat,
       captureMode: captureMode,
+      captureIntervalSeconds: intervalSeconds,
       autoCaptureIntervalMinutes: intervalMinutes,
       spreadsheetName: sheetName,
     };
     onUpdateStorageSettings(updated);
     saveStorageSettings(updated);
-    setSavedSuccessMsg('Drive storage location, random capture mode, and Google Sheet config saved successfully!');
+    setSavedSuccessMsg('Drive storage location, capture intervals, and Google Sheet config saved successfully!');
     setTimeout(() => setSavedSuccessMsg(''), 4000);
+  };
+
+  // Batch Provision All Employees in Google Drive and Master Google Sheet
+  const handleBatchProvisionAll = async () => {
+    const token = accessToken || storageSettings.adminAccessToken;
+    if (!token) {
+      setBatchProvisionStatus('⚠️ Cannot provision: Admin Google OAuth access token is missing. Please click "Connect Admin Google Drive & Sheets" or paste a token below.');
+      return;
+    }
+
+    const emps = allUsers.filter((u) => u.role === 'employee');
+    if (emps.length === 0) {
+      setBatchProvisionStatus('No employees registered yet. Sign up an employee or use quick test accounts.');
+      return;
+    }
+
+    setIsBatchProvisioning(true);
+    setBatchProvisionStatus(`Starting automatic provisioning for ${emps.length} employees...`);
+
+    try {
+      const logs: string[] = [];
+      for (const emp of emps) {
+        const res = await provisionEmployeeWorkspace(token, emp, sheetName, folderName);
+        if (res.success) {
+          logs.push(`✅ ${emp.name}: Drive folder & '${emp.name}' Sheet tab active`);
+        } else {
+          logs.push(`⚠️ ${emp.name}: ${res.message}`);
+        }
+      }
+      setBatchProvisionStatus(`Workspace Provisioning Complete for ${emps.length} staff:\n${logs.join('\n')}`);
+    } catch (err: any) {
+      setBatchProvisionStatus(`Batch provision error: ${err.message}`);
+    } finally {
+      setIsBatchProvisioning(false);
+    }
+  };
+
+  // Test and directly save Admin Access Token
+  const handleTestAndSaveToken = async () => {
+    const token = manualTokenInput.trim();
+    if (!token) {
+      setTokenTestResult('Please enter or paste a valid Google access token.');
+      return;
+    }
+
+    setIsTestingToken(true);
+    setTokenTestResult('Verifying token against Google Drive API...');
+
+    try {
+      const res = await verifyGoogleAccessToken(token);
+      if (res.valid) {
+        setTokenTestResult(`✅ Access Token Valid! Connected Google Account: ${res.user?.name} (${res.user?.email}). Saving to central settings...`);
+        const updated: StorageSettings = {
+          ...storageSettings,
+          adminAccessToken: token,
+          centralAdminEmail: res.user?.email || centralEmail,
+        };
+        onUpdateStorageSettings(updated);
+        saveStorageSettings(updated);
+      } else {
+        setTokenTestResult(`❌ Token Verification Failed: ${res.error}`);
+      }
+    } catch (err: any) {
+      setTokenTestResult(`Error testing token: ${err.message}`);
+    } finally {
+      setIsTestingToken(false);
+    }
   };
 
   // Handle Approve Signup directly
@@ -596,72 +673,52 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            {/* Random Screenshot Mode */}
+            {/* Automated Screenshot Trigger Policy */}
             <div className="p-4 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl space-y-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Shuffle className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
                   <span className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
-                    Automated Screenshot Trigger Policy
+                    Automated Screenshot Trigger Intervals
                   </span>
                 </div>
                 <span className="text-[10px] font-bold bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded">
-                  Active
+                  {captureMode === 'random_5_to_10_min' ? 'Random (5-10m)' : `${intervalSeconds}s Interval`}
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <label
-                  className={`p-3 border rounded-lg cursor-pointer transition ${
-                    captureMode === 'random_5_to_10_min'
-                      ? 'border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/40 text-indigo-950 dark:text-indigo-200 font-semibold'
-                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="radio"
-                      name="capturePolicy"
-                      checked={captureMode === 'random_5_to_10_min'}
-                      onChange={() => setCaptureMode('random_5_to_10_min')}
-                      className="text-indigo-600"
-                    />
-                    <span className="text-xs font-bold">Random Every 5 to 10 Minutes (Requested)</span>
-                  </div>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 pl-5">
-                    Unpredictable randomized triggers between 5:00 and 10:00 minutes. Upon capture, timer resets for next randomized window.
-                  </p>
-                </label>
-
-                <label
-                  className={`p-3 border rounded-lg cursor-pointer transition ${
-                    captureMode === 'fixed_interval'
-                      ? 'border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/40 text-indigo-950 dark:text-indigo-200 font-semibold'
-                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="radio"
-                      name="capturePolicy"
-                      checked={captureMode === 'fixed_interval'}
-                      onChange={() => setCaptureMode('fixed_interval')}
-                      className="text-indigo-600"
-                    />
-                    <span className="text-xs font-bold">Fixed Interval Capture</span>
-                  </div>
-                  <div className="mt-2 pl-5 flex items-center gap-2">
-                    <input
-                      type="number"
-                      min={1}
-                      max={60}
-                      value={intervalMinutes}
-                      onChange={(e) => setIntervalMinutes(Number(e.target.value))}
-                      className="w-16 text-xs border border-slate-300 dark:border-slate-700 rounded px-2 py-1 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
-                    />
-                    <span className="text-xs text-slate-500">minutes</span>
-                  </div>
-                </label>
+              <div className="space-y-2">
+                <div className="text-xs text-slate-600 dark:text-slate-400">
+                  Select default screenshot interval policy for all workstations:
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+                  {[
+                    { label: '10 sec (Test)', sec: 10, mode: 'fixed_interval' as const },
+                    { label: '20 sec (Test)', sec: 20, mode: 'fixed_interval' as const },
+                    { label: '1 min', sec: 60, mode: 'fixed_interval' as const },
+                    { label: '5 min', sec: 300, mode: 'fixed_interval' as const },
+                    { label: '10 min', sec: 600, mode: 'fixed_interval' as const },
+                    { label: '15 min', sec: 900, mode: 'fixed_interval' as const },
+                    { label: 'Random (5–10m)', sec: 420, mode: 'random_5_to_10_min' as const },
+                  ].map((opt) => (
+                    <button
+                      key={opt.label}
+                      type="button"
+                      onClick={() => {
+                        setCaptureMode(opt.mode);
+                        setIntervalSeconds(opt.sec);
+                        setIntervalMinutes(Math.max(1, Math.round(opt.sec / 60)));
+                      }}
+                      className={`p-2.5 text-xs font-bold rounded-xl border transition cursor-pointer text-center ${
+                        (captureMode === opt.mode && (opt.mode === 'random_5_to_10_min' || intervalSeconds === opt.sec))
+                          ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-950 dark:text-indigo-200 ring-2 ring-indigo-300'
+                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:bg-slate-100'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
@@ -732,6 +789,96 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <p className="text-[11px] text-slate-500 dark:text-slate-400">
                 Each employee automatically receives a dedicated tab in this sheet with start, stop, task change, and total hours.
               </p>
+            </div>
+
+            {/* Batch Workspace Provisioner */}
+            <div className="p-4 bg-indigo-50/50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800 rounded-xl space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h4 className="text-xs font-bold text-indigo-950 dark:text-indigo-200 uppercase tracking-wider">
+                    Auto-Provision All Employee Workspaces
+                  </h4>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                    Immediately creates a Drive folder (<code className="font-mono">/{folderName}/[Employee]/</code>) and a dedicated tab in your Google Sheet for all {employeesList.length} staff.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleBatchProvisionAll}
+                  disabled={isBatchProvisioning}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl transition shadow cursor-pointer disabled:opacity-50"
+                >
+                  {isBatchProvisioning ? 'Provisioning Staff...' : 'Provision All Employees'}
+                </button>
+              </div>
+
+              {batchProvisionStatus && (
+                <div className="p-3 bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-lg text-xs font-mono whitespace-pre-line text-slate-800 dark:text-slate-200 max-h-40 overflow-y-auto">
+                  {batchProvisionStatus}
+                </div>
+              )}
+            </div>
+
+            {/* Admin Google OAuth Direct Token / Connection Health Tool */}
+            <div className="p-4 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <HardDrive className="w-4 h-4 text-emerald-600" />
+                  <h4 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
+                    Google Drive & Sheets Access Status
+                  </h4>
+                </div>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                  accessToken || storageSettings.adminAccessToken
+                    ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300'
+                }`}>
+                  {accessToken || storageSettings.adminAccessToken ? 'Connected' : 'Token Required'}
+                </span>
+              </div>
+
+              <div className="text-xs text-slate-500 space-y-2">
+                <p>
+                  Current Admin Google Account: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail || centralEmail}</strong>
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onConnectDrive}
+                    className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg cursor-pointer transition"
+                  >
+                    1-Click Google OAuth Connect / Refresh
+                  </button>
+                </div>
+
+                <div className="pt-2 border-t border-slate-200 dark:border-slate-700 space-y-1.5">
+                  <label className="text-[11px] font-semibold text-slate-600 dark:text-slate-400">
+                    Direct Token Verification & Testing (Optional):
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      value={manualTokenInput}
+                      onChange={(e) => setManualTokenInput(e.target.value)}
+                      placeholder="Paste Google OAuth access_token (ya29...)"
+                      className="flex-1 text-xs border border-slate-300 dark:border-slate-700 rounded-lg px-3 py-1.5 bg-white dark:bg-slate-900 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleTestAndSaveToken}
+                      disabled={isTestingToken}
+                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold rounded-lg cursor-pointer disabled:opacity-50"
+                    >
+                      {isTestingToken ? 'Testing...' : 'Verify & Save Token'}
+                    </button>
+                  </div>
+                  {tokenTestResult && (
+                    <div className="text-[11px] p-2 bg-white dark:bg-slate-900 rounded border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200 font-mono">
+                      {tokenTestResult}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div className="pt-3">

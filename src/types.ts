@@ -71,6 +71,7 @@ export interface StorageSettings {
   centralFolderName: string;
   screenshotFormat: 'webp' | 'png' | 'jpg';
   autoCaptureIntervalMinutes: number; // base fallback
+  captureIntervalSeconds: number; // 10, 20, 60, 300, 600, 900, or random
   captureMode: 'random_5_to_10_min' | 'fixed_interval';
   adminAccessToken?: string; // Shared central Admin Google OAuth Token stored in cloud settings
   adminTokenExpiry?: string;
