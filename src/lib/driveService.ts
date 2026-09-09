@@ -1,0 +1,141 @@
+/**
+ * Google Drive API Client
+ * Creates user folders and nested date folders:
+ * Root -> User_Name (or email) -> Date (YYYY-MM-DD) -> screenshot_time.webp/png/jpg
+ * Ensuring screenshots are properly nested inside the date folder!
+ */
+
+export interface DriveFolderInfo {
+  id: string;
+  name: string;
+}
+
+export interface DriveUploadResult {
+  fileId: string;
+  fileName: string;
+  webViewLink?: string;
+}
+
+/**
+ * Searches for an existing folder with given name and optional parent.
+ * If not found, creates it.
+ */
+export async function getOrCreateFolder(
+  accessToken: string,
+  folderName: string,
+  parentId?: string
+): Promise<string> {
+  let query = `name = '${folderName.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+  if (parentId) {
+    query += ` and '${parentId}' in parents`;
+  }
+
+  const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id, name)&spaces=drive`;
+  const searchRes = await fetch(searchUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!searchRes.ok) {
+    const errText = await searchRes.text();
+    throw new Error(`Failed to search Drive folder: ${errText}`);
+  }
+
+  const searchData = await searchRes.json();
+  if (searchData.files && searchData.files.length > 0) {
+    return searchData.files[0].id;
+  }
+
+  // Create folder
+  const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: parentId ? [parentId] : undefined,
+    }),
+  });
+
+  if (!createRes.ok) {
+    const errText = await createRes.text();
+    throw new Error(`Failed to create Drive folder '${folderName}': ${errText}`);
+  }
+
+  const createData = await createRes.json();
+  return createData.id;
+}
+
+/**
+ * Uploads a binary screenshot file (WebP / PNG / JPG) to Google Drive
+ * into the designated parent folder (the Date folder inside User folder).
+ */
+export async function uploadScreenshotToDrive(
+  accessToken: string,
+  imageBlob: Blob,
+  fileName: string,
+  mimeType: string,
+  parentFolderId: string
+): Promise<DriveUploadResult> {
+  const metadata = {
+    name: fileName,
+    parents: [parentFolderId],
+    mimeType: mimeType,
+  };
+
+  const form = new FormData();
+  form.append(
+    'metadata',
+    new Blob([JSON.stringify(metadata)], { type: 'application/json' })
+  );
+  form.append('file', imageBlob);
+
+  const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink';
+  const res = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: form,
+  });
+
+  if (!res.ok) {
+    const errorBody = await res.text();
+    throw new Error(`Failed to upload screenshot to Drive: ${errorBody}`);
+  }
+
+  const data = await res.json();
+  return {
+    fileId: data.id,
+    fileName: data.name,
+    webViewLink: data.webViewLink,
+  };
+}
+
+/**
+ * Resolves the nested folder hierarchy for an employee screenshot:
+ * Main App Folder (e.g. "WorkMonitor_Captures") -> Employee Folder (e.g. "John_Doe") -> Date Folder (e.g. "2026-09-08")
+ * Returns the Date folder ID so screenshots strictly save INSIDE the date folder.
+ */
+export async function resolveEmployeeDateFolder(
+  accessToken: string,
+  rootParentId: string | undefined,
+  userName: string,
+  dateKey: string
+): Promise<{ rootFolderId: string; userFolderId: string; dateFolderId: string }> {
+  // 1. Root main directory
+  const rootFolderId = rootParentId || await getOrCreateFolder(accessToken, 'WorkMonitor_Records');
+
+  // 2. User specific folder
+  const sanitizedUserName = userName.trim().replace(/[/\\?%*:|"<>]/g, '_') || 'Employee';
+  const userFolderId = await getOrCreateFolder(accessToken, sanitizedUserName, rootFolderId);
+
+  // 3. Date specific folder INSIDE the user folder
+  const dateFolderId = await getOrCreateFolder(accessToken, dateKey, userFolderId);
+
+  return { rootFolderId, userFolderId, dateFolderId };
+}
