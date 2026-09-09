@@ -33,7 +33,10 @@ let provider: GoogleAuthProvider | null = null;
 try {
   const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
   auth = getAuth(app);
-  db = getFirestore(app);
+  
+  // Connect to the specific Firestore database ID configured for this project
+  const dbId = (firebaseConfig as any).firestoreDatabaseId;
+  db = dbId ? getFirestore(app, dbId) : getFirestore(app);
 
   provider = new GoogleAuthProvider();
   provider.addScope('https://www.googleapis.com/auth/drive.file');
@@ -44,6 +47,16 @@ try {
 }
 
 export { auth, db };
+
+// Helper to prevent any Firestore call from hanging indefinitely
+function withTimeout<T>(promise: Promise<T>, ms: number = 4000): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Firestore request timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
 
 export const WORKSPACE_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
@@ -227,7 +240,7 @@ export function subscribeToUsers(callback: (users: AppUser[]) => void) {
 export async function syncUserToFirestore(user: AppUser) {
   if (!db) return;
   try {
-    await setDoc(doc(db, 'users', user.id), user, { merge: true });
+    await withTimeout(setDoc(doc(db, 'users', user.id), user, { merge: true }), 3500);
   } catch (e) {
     console.warn('Failed to sync user to Firestore:', e);
   }
@@ -250,7 +263,7 @@ export function subscribeToPendingSignups(callback: (signups: PendingSignup[]) =
 export async function addPendingSignupToFirestore(signup: PendingSignup) {
   if (!db) return;
   try {
-    await setDoc(doc(db, 'pendingSignups', signup.id), signup);
+    await withTimeout(setDoc(doc(db, 'pendingSignups', signup.id), signup), 3500);
   } catch (e) {
     console.warn('Failed to add pending signup to Firestore:', e);
   }
@@ -259,7 +272,7 @@ export async function addPendingSignupToFirestore(signup: PendingSignup) {
 export async function removePendingSignupFromFirestore(signupId: string) {
   if (!db) return;
   try {
-    await deleteDoc(doc(db, 'pendingSignups', signupId));
+    await withTimeout(deleteDoc(doc(db, 'pendingSignups', signupId)), 3500);
   } catch (e) {
     console.warn('Failed to remove pending signup:', e);
   }
@@ -280,7 +293,7 @@ export function subscribeToStorageSettings(callback: (settings: StorageSettings)
 export async function saveStorageSettingsToFirestore(settings: StorageSettings) {
   if (!db) return;
   try {
-    await setDoc(doc(db, 'settings', 'storage'), settings, { merge: true });
+    await withTimeout(setDoc(doc(db, 'settings', 'storage'), settings, { merge: true }), 3500);
   } catch (e) {
     console.warn('Failed to save storage settings to Firestore:', e);
   }
@@ -309,7 +322,7 @@ export async function logScreenshotToFirestore(screen: ScreenshotLog) {
     if (record.previewDataUrl && record.previewDataUrl.length > 50000) {
       record.previewDataUrl = record.previewDataUrl.slice(0, 50000);
     }
-    await setDoc(doc(db, 'screenshots', screen.id), record);
+    await withTimeout(setDoc(doc(db, 'screenshots', screen.id), record), 3500);
   } catch (e) {
     console.warn('Failed to log screenshot to Firestore:', e);
   }

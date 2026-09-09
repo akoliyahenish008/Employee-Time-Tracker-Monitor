@@ -114,28 +114,28 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       // Auto-approve account directly (no verification code required)
       employee.approved = true;
       employee.lastActive = new Date().toISOString();
-      await syncUserToFirestore(employee);
+      setActiveSessionUser(employee);
+      syncUserToFirestore(employee).catch((e) => console.warn('User sync note:', e));
 
-      // Provision Drive folder & Sheet tab right on login
+      // Provision Drive folder & Sheet tab right on login if token exists
       const storageSettings = getStorageSettings();
       const token = storageSettings.adminAccessToken;
       if (token) {
         try {
-          const provResult = await provisionEmployeeWorkspace(
-            token,
-            employee,
-            storageSettings.spreadsheetName,
-            storageSettings.centralFolderName
-          );
-          if (provResult.success) {
-            console.log('Login workspace provisioned:', provResult.message);
-          }
+          await Promise.race([
+            provisionEmployeeWorkspace(
+              token,
+              employee,
+              storageSettings.spreadsheetName,
+              storageSettings.centralFolderName
+            ),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Provisioning timeout')), 5000)),
+          ]);
         } catch (provErr: any) {
           console.warn('Drive/Sheet sync notice on login:', provErr);
         }
       }
 
-      setActiveSessionUser(employee);
       onLoginSuccess(employee);
     } catch (err: any) {
       setErrorMsg(`Login error: ${err.message}`);
@@ -163,7 +163,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     }
 
     setIsSubmitting(true);
-    setStatusNotice('Creating employee account, preparing Google Drive folders & Sheets...');
+    setStatusNotice('Creating employee account...');
 
     try {
       // Create approved employee immediately!
@@ -177,36 +177,40 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
         lastActive: new Date().toISOString(),
       };
 
-      // 1. Save to local storage & Firestore
+      // 1. Save to local storage & set active session right away
       const updatedUsers = [...users, newEmployee];
       saveStoredUsers(updatedUsers);
-      await syncUserToFirestore(newEmployee);
+      setActiveSessionUser(newEmployee);
 
-      // 2. Automatically create Drive folder & employee-wise Sheet tab under Admin's account
+      // 2. Sync to Firestore in background with timeout protection
+      syncUserToFirestore(newEmployee).catch((e) => console.warn('Firestore sync note:', e));
+
+      // 3. Automatically create Drive folder & employee-wise Sheet tab under Admin's account
       const storageSettings = getStorageSettings();
       const token = storageSettings.adminAccessToken;
 
       if (token) {
-        setStatusNotice(`Creating Google Drive folder and Sheet tab for ${newEmployee.name}...`);
+        setStatusNotice(`Setting up Google Drive & Sheet tab for ${newEmployee.name}...`);
         try {
-          const provResult = await provisionEmployeeWorkspace(
-            token,
-            newEmployee,
-            storageSettings.spreadsheetName,
-            storageSettings.centralFolderName
-          );
-          if (provResult.success) {
-            setStatusNotice(`✅ Drive folder & Sheet tab created for ${newEmployee.name}! Logging in...`);
-          }
+          await Promise.race([
+            provisionEmployeeWorkspace(
+              token,
+              newEmployee,
+              storageSettings.spreadsheetName,
+              storageSettings.centralFolderName
+            ),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Provisioning timeout')), 5000)),
+          ]);
         } catch (syncErr: any) {
           console.warn('Drive/Sheet creation warning on signup:', syncErr);
         }
       }
 
-      setActiveSessionUser(newEmployee);
+      setStatusNotice(`✅ Account created for ${newEmployee.name}! Entering workstation...`);
       setTimeout(() => {
+        setIsSubmitting(false);
         onLoginSuccess(newEmployee);
-      }, 600);
+      }, 350);
     } catch (err: any) {
       setErrorMsg(`Failed to create account: ${err.message}`);
       setIsSubmitting(false);
