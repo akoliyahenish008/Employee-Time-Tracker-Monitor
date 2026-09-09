@@ -5,22 +5,33 @@ import {
   GoogleAuthProvider,
   onAuthStateChanged,
   User,
-  signOut
+  signOut,
+  Auth,
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-export const auth = getAuth(app);
+let auth: Auth | null = null;
+let provider: GoogleAuthProvider | null = null;
+
+try {
+  const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+  auth = getAuth(app);
+
+  provider = new GoogleAuthProvider();
+  provider.addScope('https://www.googleapis.com/auth/drive.file');
+  provider.addScope('https://www.googleapis.com/auth/spreadsheets');
+  provider.setCustomParameters({ prompt: 'select_account' });
+} catch (e) {
+  console.warn('Firebase failed to initialize or missing configuration:', e);
+}
+
+export { auth };
 
 // Request Google Workspace scopes for Drive file access and Spreadsheets
 export const WORKSPACE_SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/spreadsheets'
+  'https://www.googleapis.com/auth/spreadsheets',
 ];
-
-const provider = new GoogleAuthProvider();
-WORKSPACE_SCOPES.forEach(scope => provider.addScope(scope));
-provider.setCustomParameters({ prompt: 'select_account' });
 
 let cachedAccessToken: string | null = null;
 let isSigningIn = false;
@@ -29,6 +40,11 @@ export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
+  if (!auth) {
+    if (onAuthFailure) onAuthFailure();
+    return () => {};
+  }
+
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
       if (cachedAccessToken) {
@@ -45,6 +61,10 @@ export const initAuth = (
 };
 
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+  if (!auth || !provider) {
+    throw new Error('Google Authentication is not configured or initialized.');
+  }
+
   try {
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
@@ -72,6 +92,8 @@ export const setCachedToken = (token: string) => {
 };
 
 export const logoutGoogle = async () => {
-  await signOut(auth);
+  if (auth) {
+    await signOut(auth);
+  }
   cachedAccessToken = null;
 };
