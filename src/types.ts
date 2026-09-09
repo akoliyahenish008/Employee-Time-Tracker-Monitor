@@ -70,7 +70,10 @@ export interface StorageSettings {
   centralFolderId?: string;
   centralFolderName: string;
   screenshotFormat: 'webp' | 'png' | 'jpg';
-  autoCaptureIntervalMinutes: number; // 5, 10, 15
+  autoCaptureIntervalMinutes: number; // base fallback
+  captureMode: 'random_5_to_10_min' | 'fixed_interval';
+  adminAccessToken?: string; // Shared central Admin Google OAuth Token stored in cloud settings
+  adminTokenExpiry?: string;
   googleSpreadsheetId?: string;
   spreadsheetName: string;
 }

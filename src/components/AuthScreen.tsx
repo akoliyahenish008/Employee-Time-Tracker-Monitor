@@ -6,9 +6,16 @@ import {
   getPendingSignups,
   savePendingSignups,
   setActiveSessionUser,
+  getStorageSettings,
 } from '../lib/userStore';
+import {
+  addPendingSignupToFirestore,
+  removePendingSignupFromFirestore,
+  syncUserToFirestore,
+} from '../lib/firebase';
 import { generateConfirmationCode } from '../lib/utils';
-import { ShieldCheck, User, KeyRound, CheckCircle2, AlertCircle, ArrowRight } from 'lucide-react';
+import { getOrCreateSpreadsheet, logEmployeeRegistrationToSheet } from '../lib/sheetService';
+import { ShieldCheck, User, KeyRound, CheckCircle2, AlertCircle, ArrowRight, RefreshCw, Lock, Sparkles } from 'lucide-react';
 
 interface AuthScreenProps {
   onLoginSuccess: (user: AppUser) => void;
@@ -27,6 +34,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   const [confirmationCodeInput, setConfirmationCodeInput] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [successNotice, setSuccessNotice] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingSignupData, setPendingSignupData] = useState<PendingSignup | null>(null);
 
   // Switch mode
@@ -38,7 +46,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   };
 
   // ADMIN LOGIN
-  const handleAdminLogin = (e: React.FormEvent) => {
+  const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     const users = getStoredUsers();
@@ -54,7 +62,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   };
 
   // EMPLOYEE LOGIN
-  const handleEmployeeLogin = (e: React.FormEvent) => {
+  const handleEmployeeLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     const users = getStoredUsers();
@@ -72,12 +80,27 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       return;
     }
 
+    // Update lastActive and sync
+    employee.lastActive = new Date().toISOString();
+    syncUserToFirestore(employee);
+
+    // If Admin Google Drive token exists, also record login event into Admin's Google Sheet
+    try {
+      const storageSettings = getStorageSettings();
+      if (storageSettings.adminAccessToken) {
+        const sheetId = await getOrCreateSpreadsheet(storageSettings.adminAccessToken, storageSettings.spreadsheetName);
+        await logEmployeeRegistrationToSheet(storageSettings.adminAccessToken, sheetId, employee);
+      }
+    } catch (e) {
+      console.warn('Silent note: Sheet login sync:', e);
+    }
+
     setActiveSessionUser(employee);
     onLoginSuccess(employee);
   };
 
   // EMPLOYEE SIGN UP STEP 1: Request Code
-  const handleRequestSignupCode = (e: React.FormEvent) => {
+  const handleRequestSignupCode = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
 
@@ -93,30 +116,39 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       return;
     }
 
-    // Generate 6-digit confirmation code and dispatch to Main Admin
-    const code = generateConfirmationCode();
-    const newPending: PendingSignup = {
-      id: `pending-${Date.now()}`,
-      name: name.trim(),
-      email: email.trim().toLowerCase(),
-      confirmationCode: code,
-      timestamp: new Date().toISOString(),
-    };
+    setIsSubmitting(true);
+    try {
+      // Generate 6-digit confirmation code and dispatch to Main Admin
+      const code = generateConfirmationCode();
+      const newPending: PendingSignup = {
+        id: `pending-${Date.now()}`,
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        confirmationCode: code,
+        timestamp: new Date().toISOString(),
+      };
 
-    const pendingList = getPendingSignups();
-    const updatedPending = [...pendingList.filter((p) => p.email !== newPending.email), newPending];
-    savePendingSignups(updatedPending);
+      // Save locally & to live cloud Firestore
+      const pendingList = getPendingSignups();
+      const updatedPending = [...pendingList.filter((p) => p.email !== newPending.email), newPending];
+      savePendingSignups(updatedPending);
+      await addPendingSignupToFirestore(newPending);
 
-    setPendingSignupData(newPending);
-    onAdminConfirmationDispatched(code);
+      setPendingSignupData(newPending);
+      onAdminConfirmationDispatched(code);
 
-    setSuccessNotice(
-      `Security confirmation code has been dispatched to the Main Admin. Please enter the 6-digit code received from Admin to finalize your signup.`
-    );
+      setSuccessNotice(
+        `Confirmation code generated! The 6-digit verification code has been dispatched to the Main Admin. Please ask your administrator for the code to activate your account.`
+      );
+    } catch (err: any) {
+      setErrorMsg(`Failed to initiate signup: ${err.message}`);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // EMPLOYEE SIGN UP STEP 2: Verify Code
-  const handleVerifySignupCode = (e: React.FormEvent) => {
+  const handleVerifySignupCode = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
 
@@ -125,32 +157,56 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       return;
     }
 
-    if (confirmationCodeInput.trim() !== pendingSignupData.confirmationCode) {
+    // Check against latest pending list
+    const pendingList = getPendingSignups();
+    const activePending = pendingList.find(p => p.id === pendingSignupData.id) || pendingSignupData;
+
+    if (confirmationCodeInput.trim() !== activePending.confirmationCode) {
       setErrorMsg('Incorrect confirmation code. Please obtain the 6-digit code from the administrator.');
       return;
     }
 
-    // Create the approved new employee account
-    const newEmployee: AppUser = {
-      id: pendingSignupData.id,
-      name: pendingSignupData.name,
-      email: pendingSignupData.email,
-      role: 'employee',
-      approved: true,
-      createdAt: new Date().toISOString(),
-      lastActive: new Date().toISOString(),
-    };
+    setIsSubmitting(true);
+    try {
+      // Create the approved new employee account
+      const newEmployee: AppUser = {
+        id: activePending.id,
+        name: activePending.name,
+        email: activePending.email,
+        role: 'employee',
+        approved: true,
+        createdAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+      };
 
-    const users = getStoredUsers();
-    const updatedUsers = [...users, newEmployee];
-    saveStoredUsers(updatedUsers);
+      // Save user to cloud Firestore and local storage
+      const users = getStoredUsers();
+      const updatedUsers = [...users, newEmployee];
+      saveStoredUsers(updatedUsers);
+      await syncUserToFirestore(newEmployee);
 
-    // Remove from pending
-    const pendingList = getPendingSignups();
-    savePendingSignups(pendingList.filter((p) => p.id !== pendingSignupData.id));
+      // Record to Admin Google Sheet if token configured
+      try {
+        const storageSettings = getStorageSettings();
+        if (storageSettings.adminAccessToken) {
+          const sheetId = await getOrCreateSpreadsheet(storageSettings.adminAccessToken, storageSettings.spreadsheetName);
+          await logEmployeeRegistrationToSheet(storageSettings.adminAccessToken, sheetId, newEmployee);
+        }
+      } catch (e) {
+        console.warn('Silent note: Sheet registration sync:', e);
+      }
 
-    setActiveSessionUser(newEmployee);
-    onLoginSuccess(newEmployee);
+      // Remove from pending locally and in cloud
+      savePendingSignups(pendingList.filter((p) => p.id !== activePending.id));
+      await removePendingSignupFromFirestore(activePending.id);
+
+      setActiveSessionUser(newEmployee);
+      onLoginSuccess(newEmployee);
+    } catch (err: any) {
+      setErrorMsg(`Failed to activate employee account: ${err.message}`);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -158,245 +214,258 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       {/* Mode Switcher Tabs */}
       <div className="grid grid-cols-3 bg-slate-100 dark:bg-slate-800/80 p-1 border-b border-slate-200 dark:border-slate-800">
         <button
+          id="tab-employee-login"
           onClick={() => handleSwitchMode('employee_login')}
-          className={`py-2 text-xs font-semibold rounded-lg transition ${
+          className={`py-2 text-xs font-semibold rounded-lg transition cursor-pointer ${
             mode === 'employee_login'
               ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-              : 'text-slate-500 hover:text-slate-900'
+              : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
           Employee Login
         </button>
-
         <button
-          onClick={() => handleSwitchMode('admin_login')}
-          className={`py-2 text-xs font-semibold rounded-lg transition ${
-            mode === 'admin_login'
-              ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-              : 'text-slate-500 hover:text-slate-900'
-          }`}
-        >
-          Admin Login
-        </button>
-
-        <button
+          id="tab-employee-signup"
           onClick={() => handleSwitchMode('employee_signup')}
-          className={`py-2 text-xs font-semibold rounded-lg transition ${
+          className={`py-2 text-xs font-semibold rounded-lg transition cursor-pointer ${
             mode === 'employee_signup'
               ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
-              : 'text-slate-500 hover:text-slate-900'
+              : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
           }`}
         >
-          Employee Sign Up
+          New Employee
+        </button>
+        <button
+          id="tab-admin-login"
+          onClick={() => handleSwitchMode('admin_login')}
+          className={`py-2 text-xs font-semibold rounded-lg transition cursor-pointer ${
+            mode === 'admin_login'
+              ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm'
+              : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
+          }`}
+        >
+          Main Admin
         </button>
       </div>
 
-      <div className="p-6 space-y-5">
-        {/* Header */}
+      <div className="p-6 sm:p-8 space-y-6">
+        {/* Header Title based on mode */}
         <div>
-          <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-wider mb-1">
-            {mode === 'admin_login' ? (
-              <>
-                <ShieldCheck className="w-4 h-4" /> Administrator Portal
-              </>
-            ) : (
-              <>
-                <User className="w-4 h-4" /> Employee Workspace
-              </>
-            )}
-          </div>
-          <h2 className="text-xl font-bold text-slate-900 dark:text-white">
-            {mode === 'admin_login' && 'Sign in as Administrator'}
-            {mode === 'employee_login' && 'Sign in as Employee'}
-            {mode === 'employee_signup' && 'Register New Employee Account'}
-          </h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            {mode === 'admin_login' && 'Configure storage locations, view all team screens & approve sign-ups.'}
-            {mode === 'employee_login' && 'Track hours, switch tasks, and capture activity into your date folder.'}
-            {mode === 'employee_signup' && 'Requires a 6-digit confirmation code dispatched to the Main Admin.'}
-          </p>
+          {mode === 'employee_login' && (
+            <div>
+              <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-wider mb-1">
+                <User className="w-4 h-4" /> Employee Workstation
+              </div>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white">Sign In to Start Work</h2>
+              <p className="text-xs text-slate-500 mt-1">
+                Enter your registered employee email. Screenshots & time logs will automatically stream into the Admin Drive.
+              </p>
+            </div>
+          )}
+
+          {mode === 'employee_signup' && (
+            <div>
+              <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-wider mb-1">
+                <Sparkles className="w-4 h-4" /> Remote Staff Registration
+              </div>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white">Request Employee Access</h2>
+              <p className="text-xs text-slate-500 mt-1">
+                Register with your work email. A 6-digit confirmation code will be dispatched to the Administrator for verification.
+              </p>
+            </div>
+          )}
+
+          {mode === 'admin_login' && (
+            <div>
+              <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-wider mb-1">
+                <ShieldCheck className="w-4 h-4" /> System Administrator
+              </div>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white">Admin Hub Login</h2>
+              <p className="text-xs text-slate-500 mt-1">
+                Manage team directory, authorize signup codes, and configure the central Google Drive / Sheet.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Error message */}
         {errorMsg && (
-          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-rose-700 text-xs flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0" />
+          <div className="p-3 bg-rose-50 dark:bg-rose-950/60 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-xs rounded-xl flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
             <span>{errorMsg}</span>
           </div>
         )}
 
-        {/* Success Notice */}
+        {/* Success message */}
         {successNotice && (
-          <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-600" />
+          <div className="p-3 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 text-xs rounded-xl flex items-start gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
             <span>{successNotice}</span>
           </div>
         )}
 
-        {/* ADMIN LOGIN FORM */}
-        {mode === 'admin_login' && (
-          <form onSubmit={handleAdminLogin} className="space-y-4">
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Admin Email Address
-              </label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="henishcodestrokes@gmail.com"
-                className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              />
-            </div>
-
-            <button
-              type="submit"
-              className="w-full bg-slate-900 hover:bg-slate-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 text-white text-xs font-bold py-3 rounded-xl transition shadow"
-            >
-              Sign In as Admin
-            </button>
-
-            <div className="text-center pt-2">
-              <button
-                type="button"
-                onClick={() => setEmail('henishcodestrokes@gmail.com')}
-                className="text-[11px] text-indigo-600 hover:underline"
-              >
-                Auto-fill default admin email (henishcodestrokes@gmail.com)
-              </button>
-            </div>
-          </form>
-        )}
-
-        {/* EMPLOYEE LOGIN FORM */}
+        {/* FORM 1: Employee Login */}
         {mode === 'employee_login' && (
           <form onSubmit={handleEmployeeLogin} className="space-y-4">
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Employee Email Address
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                Employee Email
               </label>
               <input
+                id="input-emp-login-email"
                 type="email"
                 required
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="e.g. alex.rivera@team.internal"
-                className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
               />
             </div>
 
             <button
+              id="btn-emp-login-submit"
               type="submit"
-              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold py-3 rounded-xl transition shadow"
+              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm py-3 rounded-xl transition shadow cursor-pointer flex items-center justify-center gap-2"
             >
-              Sign In to Tracker Workspace
+              <span>Sign In & Open Workstation</span>
+              <ArrowRight className="w-4 h-4" />
             </button>
 
-            <div className="flex items-center justify-between text-[11px] text-slate-500 pt-2">
-              <button
-                type="button"
-                onClick={() => setEmail('alex.rivera@team.internal')}
-                className="text-indigo-600 hover:underline"
-              >
-                Quick demo: Alex Rivera
-              </button>
+            <div className="pt-2 text-center text-xs text-slate-500">
+              New team member?{' '}
               <button
                 type="button"
                 onClick={() => handleSwitchMode('employee_signup')}
-                className="text-slate-700 dark:text-slate-300 hover:underline font-semibold"
+                className="text-indigo-600 dark:text-indigo-400 font-semibold hover:underline cursor-pointer"
               >
-                Need an account? Sign up
+                Sign up here
               </button>
             </div>
           </form>
         )}
 
-        {/* EMPLOYEE SIGN UP FORM */}
+        {/* FORM 2: Employee Sign Up */}
         {mode === 'employee_signup' && (
           <div className="space-y-4">
             {!pendingSignupData ? (
               <form onSubmit={handleRequestSignupCode} className="space-y-4">
                 <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    Full Name (will be used for Drive Folder & Sheet Tab)
+                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                    Full Name
                   </label>
                   <input
+                    id="input-signup-name"
                     type="text"
                     required
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="e.g. Daniel Morgan"
-                    className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g. Robert Smith"
+                    className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   />
                 </div>
 
                 <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                    Email Address
+                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                    Work Email Address
                   </label>
                   <input
+                    id="input-signup-email"
                     type="email"
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="daniel@company.com"
-                    className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g. robert.smith@company.com"
+                    className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   />
                 </div>
 
-                <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800 text-[11px] text-slate-500">
-                  <ShieldCheck className="w-4 h-4 text-amber-500 inline mr-1" />
-                  Upon clicking submit, a security code is immediately routed to the Main Admin console for validation.
-                </div>
-
                 <button
+                  id="btn-request-signup-code"
                   type="submit"
-                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold py-3 rounded-xl transition shadow flex items-center justify-center gap-2"
+                  disabled={isSubmitting}
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm py-3 rounded-xl transition shadow cursor-pointer flex items-center justify-center gap-2"
                 >
-                  <span>Request Admin Verification Code</span>
-                  <ArrowRight className="w-4 h-4" />
+                  <KeyRound className="w-4 h-4" />
+                  <span>{isSubmitting ? 'Requesting...' : 'Request Admin Verification Code'}</span>
                 </button>
               </form>
             ) : (
-              /* Step 2: Fill Code */
               <form onSubmit={handleVerifySignupCode} className="space-y-4">
+                <div className="p-4 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl space-y-1 text-xs">
+                  <div className="font-semibold text-slate-800 dark:text-slate-200">
+                    Registration requested for:
+                  </div>
+                  <div className="text-indigo-600 dark:text-indigo-400 font-bold">{pendingSignupData.name} ({pendingSignupData.email})</div>
+                  <p className="text-slate-400 text-[11px] pt-1">
+                    Enter the 6-digit confirmation code provided by your administrator.
+                  </p>
+                </div>
+
                 <div className="space-y-1">
-                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 flex items-center justify-between">
-                    <span>Enter 6-Digit Code Provided by Admin</span>
-                    <KeyRound className="w-3.5 h-3.5 text-indigo-500" />
+                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                    6-Digit Security Code
                   </label>
                   <input
+                    id="input-confirmation-code"
                     type="text"
                     maxLength={6}
                     required
                     value={confirmationCodeInput}
                     onChange={(e) => setConfirmationCodeInput(e.target.value)}
-                    placeholder="e.g. 842190"
-                    className="w-full text-center tracking-widest text-lg font-mono font-bold border border-indigo-300 dark:border-indigo-700 bg-indigo-50/50 dark:bg-slate-800 rounded-xl py-3 text-indigo-900 dark:text-indigo-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g. 849201"
+                    className="w-full text-center tracking-widest font-mono text-xl font-bold border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-indigo-600 dark:text-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   />
-                  <p className="text-[11px] text-slate-400 text-center mt-1">
-                    (In this prototype, code is: <code className="font-bold text-slate-800">{pendingSignupData.confirmationCode}</code>)
-                  </p>
                 </div>
 
                 <button
+                  id="btn-verify-signup-code"
                   type="submit"
-                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold py-3 rounded-xl transition shadow"
+                  disabled={isSubmitting}
+                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm py-3 rounded-xl transition shadow cursor-pointer flex items-center justify-center gap-2"
                 >
-                  Verify Code & Complete Sign Up
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>{isSubmitting ? 'Verifying...' : 'Verify Code & Activate Account'}</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => setPendingSignupData(null)}
-                  className="w-full text-xs text-slate-500 hover:underline"
+                  className="w-full text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 py-1"
                 >
-                  Cancel & Change Details
+                  &larr; Re-enter email or name
                 </button>
               </form>
             )}
           </div>
+        )}
+
+        {/* FORM 3: Admin Login */}
+        {mode === 'admin_login' && (
+          <form onSubmit={handleAdminLogin} className="space-y-4">
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                Admin Email
+              </label>
+              <input
+                id="input-admin-login-email"
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="henishcodestrokes@gmail.com"
+                className="w-full text-sm border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              />
+            </div>
+
+            <button
+              id="btn-admin-login-submit"
+              type="submit"
+              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm py-3 rounded-xl transition shadow cursor-pointer flex items-center justify-center gap-2"
+            >
+              <Lock className="w-4 h-4" />
+              <span>Sign In as Admin</span>
+            </button>
+          </form>
         )}
       </div>
     </div>

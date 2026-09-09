@@ -15,7 +15,9 @@ import {
   ChevronRight,
   TrendingUp,
   Activity,
-  Monitor
+  Monitor,
+  Shuffle,
+  HardDrive
 } from 'lucide-react';
 import {
   formatSecondsToHoursMinutes,
@@ -33,6 +35,7 @@ import {
   getOrCreateSpreadsheet,
   logTaskIntervalToSheet,
 } from '../lib/sheetService';
+import { logScreenshotToFirestore } from '../lib/firebase';
 
 interface EmployeeDashboardProps {
   currentUser: AppUser;
@@ -64,10 +67,18 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const [selectedHourTab, setSelectedHourTab] = useState<string>('all');
   const [previewModal, setPreviewModal] = useState<ScreenshotLog | null>(null);
 
+  // Next randomized capture countdown and timestamp
+  const [nextCaptureInSec, setNextCaptureInSec] = useState<number | null>(null);
+  const [lastCapturedTimeStr, setLastCapturedTimeStr] = useState<string>('');
+
   // Screen capture references
   const screenStreamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<number | null>(null);
-  const autoCaptureRef = useRef<number | null>(null);
+  const randomCaptureTimerRef = useRef<number | null>(null);
+  const countdownIntervalRef = useRef<number | null>(null);
+
+  // Effective token: Either employee's direct session token OR the central Admin's synced token
+  const effectiveDriveToken = accessToken || storageSettings.adminAccessToken || null;
 
   // Keep track of tasks switched today
   const [taskHistory, setTaskHistory] = useState<
@@ -79,7 +90,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     }>
   >([]);
 
-  // Timer loop
+  // Timer loop for tracking work duration
   useEffect(() => {
     if (isTracking && !isPaused) {
       timerRef.current = window.setInterval(() => {
@@ -97,13 +108,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     };
   }, [isTracking, isPaused]);
 
-  // Clean up screen stream on unmount
+  // Clean up timers on unmount
   useEffect(() => {
     return () => {
       if (screenStreamRef.current) {
         screenStreamRef.current.getTracks().forEach((track) => track.stop());
       }
-      if (autoCaptureRef.current) clearInterval(autoCaptureRef.current);
+      if (randomCaptureTimerRef.current) clearTimeout(randomCaptureTimerRef.current);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
     };
   }, []);
 
@@ -136,15 +148,53 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   };
 
   /**
+   * Helper to schedule the next random screenshot between 5 and 10 minutes (300 to 600 seconds)
+   * or based on fixed interval if selected by admin.
+   */
+  const scheduleNextScreenshot = () => {
+    if (randomCaptureTimerRef.current) clearTimeout(randomCaptureTimerRef.current);
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+
+    let delaySeconds = 420; // default 7 min
+
+    if (storageSettings.captureMode === 'fixed_interval') {
+      delaySeconds = Math.max(1, storageSettings.autoCaptureIntervalMinutes || 7) * 60;
+    } else {
+      // Random between 5 minutes (300s) and 10 minutes (600s)
+      const minSec = 300;
+      const maxSec = 600;
+      delaySeconds = Math.floor(Math.random() * (maxSec - minSec + 1)) + minSec;
+    }
+
+    setNextCaptureInSec(delaySeconds);
+
+    // Countdown tick for UI
+    countdownIntervalRef.current = window.setInterval(() => {
+      setNextCaptureInSec((prev) => {
+        if (prev === null || prev <= 1) return 0;
+        return prev - 1;
+      });
+    }, 1000);
+
+    // Scheduled trigger
+    randomCaptureTimerRef.current = window.setTimeout(async () => {
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      await captureAndUploadScreen();
+      // After capture, time and next random cycle resets!
+      scheduleNextScreenshot();
+    }, delaySeconds * 1000);
+  };
+
+  /**
    * Captures screen frame as binary WebP, PNG, or JPG,
-   * uploads directly to Drive into: User Folder -> Date Folder -> capture.[ext]
+   * uploads directly to Admin's Drive into: User Folder -> Date Folder -> capture.[ext]
    */
   const captureAndUploadScreen = async (overrideTask?: string) => {
     try {
-      setLastSyncStatus('Capturing entire computer screen...');
+      setLastSyncStatus('Capturing screen frame...');
       const stream = await initScreenStream();
       if (!stream) {
-        setLastSyncStatus('Capture skipped: No screen stream active');
+        setLastSyncStatus('Capture skipped: Screen permission cancelled');
         return;
       }
 
@@ -154,16 +204,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         : null;
 
       const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
 
       if (imageCapture) {
         try {
           const bitmap = await imageCapture.grabFrame();
           canvas.width = bitmap.width;
           canvas.height = bitmap.height;
+          const ctx = canvas.getContext('2d');
           ctx?.drawImage(bitmap, 0, 0);
         } catch {
-          // Fallback to video element
           await captureViaVideoElement(stream, canvas);
         }
       } else {
@@ -181,38 +230,45 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       const hourKey = getHourSlotKey(now);
       const currentTask = overrideTask || taskName;
 
-      // File name format e.g. "Screen_2026-09-08_09-15-22.webp"
+      // File name format e.g. "Screen_2026-09-09_09-15-22.webp"
       const safeTimeName = now.toTimeString().split(' ')[0].replace(/:/g, '-');
       const fileName = `Screen_${dateKey}_${safeTimeName}.${extension}`;
 
       let driveFileId: string | undefined;
       let driveWebLink: string | undefined;
 
-      // If Google token available, upload directly to nested Drive folder
-      if (accessToken) {
-        setLastSyncStatus(`Uploading binary .${extension} to Drive date folder...`);
-        // Resolve nested path: Root -> User Name -> Date Folder
-        const { dateFolderId } = await resolveEmployeeDateFolder(
-          accessToken,
-          storageSettings.centralFolderId,
-          currentUser.name,
-          dateKey
-        );
+      // Upload using central Admin's Google Drive OAuth token or current token
+      const uploadToken = effectiveDriveToken;
 
-        const uploadRes = await uploadScreenshotToDrive(
-          accessToken,
-          blob,
-          fileName,
-          mimeType,
-          dateFolderId
-        );
+      if (uploadToken) {
+        setLastSyncStatus(`Uploading binary .${extension} directly to Admin Google Drive...`);
+        try {
+          // Resolve nested path: Root -> User Name -> Date Folder
+          const { dateFolderId } = await resolveEmployeeDateFolder(
+            uploadToken,
+            storageSettings.centralFolderId,
+            currentUser.name,
+            dateKey
+          );
 
-        driveFileId = uploadRes.fileId;
-        driveWebLink = uploadRes.webViewLink;
-        setDriveUploadCount((c) => c + 1);
-        setLastSyncStatus(`Saved to Drive Date Folder: ${fileName}`);
+          const uploadRes = await uploadScreenshotToDrive(
+            uploadToken,
+            blob,
+            fileName,
+            mimeType,
+            dateFolderId
+          );
+
+          driveFileId = uploadRes.fileId;
+          driveWebLink = uploadRes.webViewLink;
+          setDriveUploadCount((c) => c + 1);
+          setLastSyncStatus(`Saved to Admin Drive (${storageSettings.centralAdminEmail}): ${fileName}`);
+        } catch (uploadErr: any) {
+          console.warn('Drive upload attempt warning:', uploadErr);
+          setLastSyncStatus(`Drive upload warning: ${uploadErr.message}`);
+        }
       } else {
-        setLastSyncStatus(`Screen captured locally (.${extension}). Connect Drive to sync.`);
+        setLastSyncStatus(`Captured screen locally (.${extension}) & synced to Admin Live Database.`);
       }
 
       // Log screenshot entry
@@ -234,7 +290,9 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         productivityLabel: 'High',
       };
 
+      setLastCapturedTimeStr(timeFormatted);
       onNewScreenshot(newLog);
+      await logScreenshotToFirestore(newLog);
     } catch (err: any) {
       console.error('Screenshot error:', err);
       setLastSyncStatus(`Capture warning: ${err.message}`);
@@ -261,7 +319,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
   /**
    * START TRACKING:
-   * Initializes timer, triggers instant screenshot, sets interval capture
+   * Initializes timer, triggers instant screenshot, sets 5-10 minute randomized capture loop
    */
   const handleStartTracking = async () => {
     const stream = await initScreenStream();
@@ -278,12 +336,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     // Take immediate screen capture
     await captureAndUploadScreen(taskName);
 
-    // Setup periodic capture (e.g. Every 5 mins, or 1 min in dev test)
-    const intervalMs = Math.max(1, storageSettings.autoCaptureIntervalMinutes) * 60 * 1000;
-    if (autoCaptureRef.current) clearInterval(autoCaptureRef.current);
-    autoCaptureRef.current = window.setInterval(() => {
-      captureAndUploadScreen();
-    }, intervalMs);
+    // Schedule next randomized capture (5 to 10 minutes)
+    scheduleNextScreenshot();
   };
 
   /**
@@ -292,27 +346,34 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
    */
   const handlePauseTracking = async () => {
     setIsPaused(true);
-    if (autoCaptureRef.current) clearInterval(autoCaptureRef.current);
+    if (randomCaptureTimerRef.current) clearTimeout(randomCaptureTimerRef.current);
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    setNextCaptureInSec(null);
 
     const now = new Date();
     const pauseTimeStr = formatTimeString(now);
     const durationHours = secondsToDecimalHours(sessionSeconds);
+    const token = effectiveDriveToken;
 
-    if (accessToken && sessionSeconds > 5) {
-      setLastSyncStatus('Logging pause interval into Google Sheet...');
-      const spreadsheetId = await getOrCreateSpreadsheet(accessToken, storageSettings.spreadsheetName);
-      await logTaskIntervalToSheet(accessToken, spreadsheetId, {
-        date: getTodayDateKey(now),
-        userName: currentUser.name,
-        taskName: taskName,
-        startTime: currentTaskStartTime,
-        endTime: pauseTimeStr,
-        durationFormatted: formatSecondsToHoursMinutes(sessionSeconds),
-        durationHours: durationHours,
-        status: 'Paused',
-        screenshotCount: 1,
-        productivityScore: '92%',
-      });
+    if (token && sessionSeconds > 5) {
+      setLastSyncStatus('Logging pause interval into Admin Google Sheet...');
+      try {
+        const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+        await logTaskIntervalToSheet(token, spreadsheetId, {
+          date: getTodayDateKey(now),
+          userName: currentUser.name,
+          taskName: taskName,
+          startTime: currentTaskStartTime,
+          endTime: pauseTimeStr,
+          durationFormatted: formatSecondsToHoursMinutes(sessionSeconds),
+          durationHours: durationHours,
+          status: 'Paused',
+          screenshotCount: 1,
+          productivityScore: '92%',
+        });
+      } catch (err: any) {
+        console.warn('Sheet sync warning:', err);
+      }
     }
 
     setLastSyncStatus(`Tracking paused at ${pauseTimeStr}`);
@@ -324,12 +385,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     setCurrentTaskStartTime(formatTimeString(now));
     setSessionSeconds(0); // new segment
 
-    const intervalMs = Math.max(1, storageSettings.autoCaptureIntervalMinutes) * 60 * 1000;
-    if (autoCaptureRef.current) clearInterval(autoCaptureRef.current);
-    autoCaptureRef.current = window.setInterval(() => {
-      captureAndUploadScreen();
-    }, intervalMs);
-
+    scheduleNextScreenshot();
     setLastSyncStatus('Tracking resumed');
   };
 
@@ -340,27 +396,34 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const handleStopTracking = async () => {
     setIsTracking(false);
     setIsPaused(false);
-    if (autoCaptureRef.current) clearInterval(autoCaptureRef.current);
+    if (randomCaptureTimerRef.current) clearTimeout(randomCaptureTimerRef.current);
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    setNextCaptureInSec(null);
 
     const now = new Date();
     const stopTimeStr = formatTimeString(now);
     const durationHours = secondsToDecimalHours(sessionSeconds);
+    const token = effectiveDriveToken;
 
-    if (accessToken && sessionSeconds > 2) {
-      setLastSyncStatus('Updating Google Sheet with total task hours...');
-      const spreadsheetId = await getOrCreateSpreadsheet(accessToken, storageSettings.spreadsheetName);
-      await logTaskIntervalToSheet(accessToken, spreadsheetId, {
-        date: getTodayDateKey(now),
-        userName: currentUser.name,
-        taskName: taskName,
-        startTime: currentTaskStartTime,
-        endTime: stopTimeStr,
-        durationFormatted: formatSecondsToHoursMinutes(sessionSeconds),
-        durationHours: durationHours,
-        status: 'Stopped / Logged Out',
-        screenshotCount: 1,
-        productivityScore: '94%',
-      });
+    if (token && sessionSeconds > 2) {
+      setLastSyncStatus('Updating Admin Google Sheet with total task hours...');
+      try {
+        const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+        await logTaskIntervalToSheet(token, spreadsheetId, {
+          date: getTodayDateKey(now),
+          userName: currentUser.name,
+          taskName: taskName,
+          startTime: currentTaskStartTime,
+          endTime: stopTimeStr,
+          durationFormatted: formatSecondsToHoursMinutes(sessionSeconds),
+          durationHours: durationHours,
+          status: 'Stopped / Logged Out',
+          screenshotCount: 1,
+          productivityScore: '94%',
+        });
+      } catch (err: any) {
+        console.warn('Sheet sync warning:', err);
+      }
     }
 
     // Save to local history
@@ -397,24 +460,29 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     const switchTimeStr = formatTimeString(now);
     const segmentDuration = sessionSeconds;
     const durationHours = secondsToDecimalHours(segmentDuration);
+    const token = effectiveDriveToken;
 
     setLastSyncStatus(`Switching task: logging '${previousTask}' to Sheet...`);
 
     // 1. Log previous task block to Google Sheet
-    if (accessToken && segmentDuration > 0) {
-      const spreadsheetId = await getOrCreateSpreadsheet(accessToken, storageSettings.spreadsheetName);
-      await logTaskIntervalToSheet(accessToken, spreadsheetId, {
-        date: getTodayDateKey(now),
-        userName: currentUser.name,
-        taskName: previousTask,
-        startTime: currentTaskStartTime,
-        endTime: switchTimeStr,
-        durationFormatted: formatSecondsToHoursMinutes(segmentDuration),
-        durationHours: durationHours,
-        status: 'Task Switched',
-        screenshotCount: 1,
-        productivityScore: '90%',
-      });
+    if (token && segmentDuration > 0) {
+      try {
+        const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+        await logTaskIntervalToSheet(token, spreadsheetId, {
+          date: getTodayDateKey(now),
+          userName: currentUser.name,
+          taskName: previousTask,
+          startTime: currentTaskStartTime,
+          endTime: switchTimeStr,
+          durationFormatted: formatSecondsToHoursMinutes(segmentDuration),
+          durationHours: durationHours,
+          status: 'Task Switched',
+          screenshotCount: 1,
+          productivityScore: '90%',
+        });
+      } catch (err: any) {
+        console.warn('Sheet sync warning:', err);
+      }
     }
 
     // Record in local history
@@ -433,8 +501,11 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     setCurrentTaskStartTime(switchTimeStr);
     setSessionSeconds(0);
 
-    // 3. Immediately capture screen under the new task
+    // 3. Immediately capture screen under the new task and reschedule
     await captureAndUploadScreen(newTaskName.trim());
+    if (isTracking && !isPaused) {
+      scheduleNextScreenshot();
+    }
 
     setLastSyncStatus(`Switched to '${newTaskName.trim()}' at ${switchTimeStr}`);
   };
@@ -450,74 +521,72 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   return (
     <div className="w-full max-w-7xl mx-auto space-y-6">
       {/* Top Tracker Control Box */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6">
           {/* Left: Task Input & Status */}
           <div className="space-y-3 flex-1">
             <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              <span className={`w-2.5 h-2.5 rounded-full ${isTracking && !isPaused ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`}></span>
               <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Desktop Time Tracker & Monitor
+                Remote Employee Workstation ({currentUser.name})
+              </span>
+              <span className="bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 text-[10px] font-semibold px-2 py-0.5 rounded flex items-center gap-1">
+                <Shuffle className="w-3 h-3" /> Random 5–10m Capture
               </span>
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Currently Working On Task:</label>
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">Currently Working On Task:</label>
               <div className="flex items-center gap-2">
                 <input
                   id="task-name-input"
                   type="text"
                   value={taskName}
                   onChange={(e) => setTaskName(e.target.value)}
-                  onBlur={(e) => {
-                    if (isTracking && e.target.value !== taskName) {
-                      handleSwitchTask(e.target.value);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && isTracking) {
-                      handleSwitchTask(taskName);
-                    }
-                  }}
-                  className="flex-1 text-sm font-medium border border-slate-300 rounded-xl px-4 py-2.5 text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
-                  placeholder="Enter task name (e.g. Design Wireframes, Code API)..."
+                  placeholder="e.g. Backend API Optimization"
+                  className="flex-1 text-sm font-medium border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 rounded-xl px-3.5 py-2.5 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                 />
                 {isTracking && (
                   <button
                     onClick={() => handleSwitchTask(taskName)}
-                    className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold px-3 py-2.5 rounded-xl transition whitespace-nowrap"
+                    className="px-3.5 py-2.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl transition cursor-pointer"
                   >
-                    Switch Task Log
+                    Switch Task & Log
                   </button>
                 )}
               </div>
             </div>
 
-            {/* Status sync message */}
-            <div className="flex items-center gap-2 text-xs text-slate-500">
-              <Activity className="w-3.5 h-3.5 text-indigo-500" />
-              <span>{lastSyncStatus}</span>
+            {/* Live Sync Status Banner */}
+            <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2 pt-1">
+              <span>Status:</span>
+              <span className="font-semibold text-slate-700 dark:text-slate-300">{lastSyncStatus}</span>
+              {isTracking && nextCaptureInSec !== null && (
+                <span className="bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 px-2 py-0.5 rounded font-mono text-[11px] font-semibold">
+                  Next random capture in: ~{Math.floor(nextCaptureInSec / 60)}m {nextCaptureInSec % 60}s
+                </span>
+              )}
             </div>
           </div>
 
-          {/* Middle: Timer display (NaN-proof) */}
-          <div className="flex items-center gap-8 bg-slate-50 px-6 py-4 rounded-xl border border-slate-100">
+          {/* Middle: Timer display */}
+          <div className="flex items-center gap-6 bg-slate-50 dark:bg-slate-800/60 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
             <div>
-              <div className="text-[11px] font-semibold text-slate-400 uppercase">Current Task Time</div>
-              <div className="text-2xl font-mono font-bold text-slate-900">
+              <div className="text-[11px] font-semibold text-slate-400 uppercase">Current Task Duration</div>
+              <div className="text-3xl font-mono font-black text-slate-900 dark:text-white tracking-tight">
                 {formatSecondsToHoursMinutes(sessionSeconds)}
               </div>
             </div>
 
-            <div className="h-10 w-px bg-slate-200"></div>
+            <div className="h-10 w-px bg-slate-200 dark:bg-slate-700"></div>
 
             <div>
               <div className="text-[11px] font-semibold text-slate-400 uppercase">Today Total Tracked</div>
-              <div className="text-2xl font-mono font-bold text-indigo-600">
+              <div className="text-2xl font-mono font-bold text-indigo-600 dark:text-indigo-400">
                 {formatSecondsToHoursMinutes(dayTotalSeconds)}
               </div>
               <div className="text-[10px] text-slate-400">
-                {secondsToDecimalHours(dayTotalSeconds)} decimal hrs (Never NaN)
+                {secondsToDecimalHours(dayTotalSeconds)} decimal hrs
               </div>
             </div>
           </div>
@@ -528,7 +597,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               <button
                 id="btn-start-tracking"
                 onClick={handleStartTracking}
-                className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm px-6 py-3 rounded-xl transition shadow-sm hover:shadow"
+                className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm px-6 py-3 rounded-xl transition shadow-sm hover:shadow cursor-pointer"
               >
                 <Play className="w-4 h-4 fill-white" />
                 <span>Start Tracking</span>
@@ -539,7 +608,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <button
                     id="btn-pause-tracking"
                     onClick={handlePauseTracking}
-                    className="flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm"
+                    className="flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm cursor-pointer"
                   >
                     <Pause className="w-4 h-4" />
                     <span>Pause</span>
@@ -548,7 +617,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <button
                     id="btn-resume-tracking"
                     onClick={handleResumeTracking}
-                    className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm"
+                    className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm cursor-pointer"
                   >
                     <Play className="w-4 h-4 fill-white" />
                     <span>Resume</span>
@@ -558,7 +627,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                 <button
                   id="btn-stop-tracking"
                   onClick={handleStopTracking}
-                  className="flex items-center gap-2 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm"
+                  className="flex items-center gap-2 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-sm px-4 py-3 rounded-xl transition shadow-sm cursor-pointer"
                 >
                   <Square className="w-4 h-4 fill-white" />
                   <span>Stop & Log Out</span>
@@ -567,8 +636,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                 <button
                   id="btn-manual-capture"
                   onClick={() => captureAndUploadScreen()}
-                  title="Capture Screen Now"
-                  className="p-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl transition"
+                  title="Capture Screen Now & Reset Timer"
+                  className="p-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl transition cursor-pointer"
                 >
                   <Camera className="w-4 h-4" />
                 </button>
@@ -577,212 +646,176 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           </div>
         </div>
 
-        {/* Google Drive Status Bar */}
-        <div className="mt-4 pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2 text-slate-600">
+        {/* Central Storage Destination Bar */}
+        <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
             <Monitor className="w-4 h-4 text-indigo-500" />
-            <span>Format: <strong className="uppercase">.{storageSettings.screenshotFormat}</strong></span>
+            <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
             <span>&bull;</span>
-            <span>Target: <strong>/{currentUser.name}/{getTodayDateKey()}/</strong></span>
+            <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
+            <span>&bull;</span>
+            <span>Format: <strong className="uppercase font-mono">.{storageSettings.screenshotFormat}</strong></span>
           </div>
 
-          {!accessToken ? (
-            <button
-              onClick={onConnectDrive}
-              className="text-xs text-indigo-600 font-semibold hover:underline flex items-center gap-1"
-            >
-              Connect Google Drive & Sheets to enable cloud synchronization →
-            </button>
-          ) : (
-            <div className="text-emerald-700 flex items-center gap-1.5 font-medium">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-              <span>Drive & Sheet Sync Active ({driveUploadCount} captures sent to date folder)</span>
-            </div>
-          )}
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-semibold bg-emerald-50 dark:bg-emerald-950/60 px-2.5 py-1 rounded-full border border-emerald-200 dark:border-emerald-800">
+              <HardDrive className="w-3.5 h-3.5" />
+              <span>Direct Admin Drive & Sheet Routing</span>
+            </span>
+          </div>
         </div>
       </div>
 
-      {/* Main Content Area */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left 2 Cols: Hour Wise Tabbing and Screenshots Gallery */}
-        <div className="lg:col-span-2 space-y-4">
-          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <h3 className="text-base font-bold text-slate-800">My Desktop Screenshot Log</h3>
-                <p className="text-xs text-slate-500">
-                  Screenshots captured automatically and saved inside today's date folder on Google Drive.
-                </p>
-              </div>
-              <span className="text-xs font-semibold bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-lg">
-                {userScreenshots.length} Captures Today
-              </span>
-            </div>
+      {/* Hour-Wise Filter Tabs & Gallery */}
+      <div className="space-y-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">
+              My Hourly Screenshot History (Today)
+            </h2>
+            <p className="text-xs text-slate-500">
+              Random captures (5–10 min intervals) automatically funneled to Admin Drive
+            </p>
+          </div>
 
-            {/* Hour-wise Tabbing Bar */}
-            <div className="flex items-center gap-2 overflow-x-auto pb-1">
+          {/* Hour Tabs */}
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1 max-w-full">
+            <button
+              onClick={() => setSelectedHourTab('all')}
+              className={`px-3 py-1.5 text-xs rounded-lg transition whitespace-nowrap cursor-pointer ${
+                selectedHourTab === 'all'
+                  ? 'bg-indigo-600 text-white font-bold'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
+              }`}
+            >
+              All Hours ({userScreenshots.length})
+            </button>
+            {availableHours.map((hr) => (
               <button
-                onClick={() => setSelectedHourTab('all')}
-                className={`px-3 py-1.5 text-xs rounded-lg font-medium transition whitespace-nowrap ${
-                  selectedHourTab === 'all'
-                    ? 'bg-slate-900 text-white'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                key={hr}
+                onClick={() => setSelectedHourTab(hr)}
+                className={`px-3 py-1.5 text-xs rounded-lg transition whitespace-nowrap cursor-pointer ${
+                  selectedHourTab === hr
+                    ? 'bg-indigo-600 text-white font-bold'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
                 }`}
               >
-                All Hours (Whole Day)
+                {hr}
               </button>
-              {availableHours.map((hourStr) => (
-                <button
-                  key={hourStr}
-                  onClick={() => setSelectedHourTab(hourStr)}
-                  className={`px-3 py-1.5 text-xs rounded-lg font-medium transition whitespace-nowrap ${
-                    selectedHourTab === hourStr
-                      ? 'bg-indigo-600 text-white'
-                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                  }`}
-                >
-                  {hourStr}
-                </button>
-              ))}
-            </div>
+            ))}
           </div>
+        </div>
 
-          {/* Screenshot Cards */}
-          {filteredScreenshots.length === 0 ? (
-            <div className="bg-white border border-dashed border-slate-200 rounded-xl p-10 text-center text-slate-500">
-              <Camera className="w-8 h-8 mx-auto text-slate-300 mb-2" />
-              <div className="font-semibold text-slate-700">No screenshots recorded yet</div>
-              <p className="text-xs text-slate-400 mt-1">
-                Click "Start Tracking" to begin monitoring your desktop activity.
-              </p>
+        {/* Screenshot Grid */}
+        {filteredScreenshots.length === 0 ? (
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-12 text-center text-slate-400">
+            <Camera className="w-8 h-8 mx-auto mb-2 text-slate-300" />
+            <div className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+              No screenshots captured yet today
             </div>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {filteredScreenshots.map((sc) => (
+            <p className="text-xs text-slate-400 mt-1">
+              Click &quot;Start Tracking&quot; above to begin the automated random 5–10 minute capture cycle.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            {filteredScreenshots.map((screen) => (
+              <div
+                key={screen.id}
+                className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden shadow-sm hover:shadow transition flex flex-col"
+              >
                 <div
-                  key={sc.id}
-                  className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm hover:shadow transition flex flex-col"
+                  onClick={() => setPreviewModal(screen)}
+                  className="relative cursor-pointer bg-slate-950 aspect-video group overflow-hidden"
                 >
-                  <div
-                    className="relative cursor-pointer bg-slate-900 aspect-video group"
-                    onClick={() => setPreviewModal(sc)}
-                  >
-                    <img
-                      src={sc.previewDataUrl}
-                      alt={sc.taskName}
-                      className="w-full h-full object-cover group-hover:scale-105 transition duration-300"
-                    />
-                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-white text-xs font-semibold">
-                      Click to View Fullscreen (.{sc.fileFormat})
-                    </div>
-                    <span className="absolute top-2 right-2 bg-slate-900/80 text-white text-[10px] font-bold px-1.5 py-0.5 rounded uppercase">
-                      .{sc.fileFormat}
-                    </span>
+                  <img
+                    src={screen.previewDataUrl}
+                    alt={screen.taskName}
+                    className="w-full h-full object-cover group-hover:scale-105 transition duration-200"
+                  />
+                  <div className="absolute top-2 right-2 bg-black/70 text-white text-[10px] font-mono px-2 py-0.5 rounded">
+                    .{screen.fileFormat}
                   </div>
-
-                  <div className="p-3 flex-1 flex flex-col justify-between">
-                    <div>
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-bold text-slate-800 truncate">{sc.taskName}</span>
-                        <span className="text-slate-400 text-[11px]">{sc.timeFormatted}</span>
-                      </div>
-                      <div className="text-[11px] text-slate-500 mt-0.5">{sc.hourKey}</div>
-                    </div>
-
-                    <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px]">
-                      <span className="text-emerald-600 font-medium">In Date Folder</span>
-                      {sc.driveWebLink && (
-                        <a
-                          href={sc.driveWebLink}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-indigo-600 hover:underline flex items-center gap-1 font-medium"
-                        >
-                          Google Drive <ExternalLink className="w-3 h-3" />
-                        </a>
-                      )}
-                    </div>
+                  <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] font-medium px-2 py-0.5 rounded">
+                    {screen.timeFormatted}
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </div>
 
-        {/* Right Col: Task Switch Log & Today Breakdown */}
-        <div className="space-y-4">
-          <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm space-y-4">
-            <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-indigo-600" />
-              <span>Today Task Log Intervals</span>
-            </h3>
-            <p className="text-xs text-slate-500">
-              Each task interval is recorded and synced to your dedicated Google Sheet tab with start/stop times.
-            </p>
-
-            {taskHistory.length === 0 ? (
-              <div className="text-xs text-slate-400 text-center py-6 border border-dashed rounded-lg">
-                No task switches completed yet. As you change tasks, completed intervals appear here.
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {taskHistory.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className="p-3 bg-slate-50 rounded-lg border border-slate-100 flex items-center justify-between text-xs"
-                  >
-                    <div>
-                      <div className="font-semibold text-slate-900">{item.taskName}</div>
-                      <div className="text-[11px] text-slate-500">
-                        {item.start} → {item.end}
-                      </div>
+                <div className="p-3 flex-1 flex flex-col justify-between">
+                  <div>
+                    <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                      {screen.taskName}
                     </div>
-                    <div className="text-right">
-                      <div className="font-mono font-bold text-indigo-700">
-                        {formatSecondsToHoursMinutes(item.durationSec)}
-                      </div>
-                      <div className="text-[10px] text-slate-400">
-                        {secondsToDecimalHours(item.durationSec)} hrs
-                      </div>
+                    <div className="text-[11px] text-slate-400 mt-0.5">
+                      Hour slot: {screen.hourKey}
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
 
-          {/* Quick Stats Widget */}
-          <div className="bg-gradient-to-br from-indigo-900 to-slate-900 text-white rounded-xl p-5 shadow-sm space-y-3">
-            <div className="text-xs font-semibold text-indigo-300 uppercase tracking-wider">
-              Monthly Summary Overview
-            </div>
-            <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-bold">14.5</span>
-              <span className="text-sm text-indigo-200">total hours tracked this month</span>
-            </div>
-            <p className="text-xs text-slate-300">
-              Logged accurately into Google Sheet master tab <span className="underline">{storageSettings.spreadsheetName}</span>.
-            </p>
+                  <div className="mt-3 pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400 font-mono">{screen.dateKey}</span>
+                    {screen.driveWebLink ? (
+                      <a
+                        href={screen.driveWebLink}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 font-semibold"
+                      >
+                        <span>Saved to Admin Drive</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    ) : (
+                      <span className="text-emerald-600 dark:text-emerald-400 font-medium">Logged</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
-        </div>
+        )}
       </div>
 
-      {/* Enlarged Screenshot Modal */}
+      {/* Task History & Hour Switch Breakdown */}
+      {taskHistory.length > 0 && (
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
+              Completed Task Intervals (Logged to Master Google Sheet)
+            </h3>
+            <span className="text-[11px] text-slate-400">Sheet Tab: {currentUser.name}</span>
+          </div>
+
+          <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+            {taskHistory.map((item, idx) => (
+              <div key={idx} className="py-2.5 flex items-center justify-between">
+                <div>
+                  <span className="font-semibold text-slate-900 dark:text-white">{item.taskName}</span>
+                  <span className="text-slate-400 ml-2 font-mono text-[11px]">
+                    {item.start} &rarr; {item.end}
+                  </span>
+                </div>
+                <div className="font-mono font-bold text-indigo-600 dark:text-indigo-400">
+                  {formatSecondsToHoursMinutes(item.durationSec)} ({secondsToDecimalHours(item.durationSec)} hrs)
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Image Preview Modal */}
       {previewModal && (
         <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-4xl w-full overflow-hidden shadow-2xl border border-slate-200 dark:border-slate-800 flex flex-col">
             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
               <div>
-                <div className="font-bold text-sm text-slate-900 dark:text-white">
-                  Task: {previewModal.taskName}
-                </div>
+                <div className="font-bold text-sm text-slate-900 dark:text-white">{previewModal.taskName}</div>
                 <div className="text-xs text-slate-500">
                   {previewModal.dateKey} at {previewModal.timeFormatted} ({previewModal.hourKey})
                 </div>
               </div>
               <button
                 onClick={() => setPreviewModal(null)}
-                className="text-slate-400 hover:text-slate-600 dark:hover:text-white text-sm font-semibold px-2 py-1"
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-white text-sm font-semibold px-2 py-1 cursor-pointer"
               >
                 Close ✕
               </button>
@@ -790,20 +823,21 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
             <div className="p-4 bg-slate-950 flex items-center justify-center max-h-[70vh] overflow-auto">
               <img
                 src={previewModal.previewDataUrl}
-                alt="Enlarged desktop capture"
+                alt={previewModal.taskName}
                 className="max-h-[65vh] w-auto object-contain rounded"
               />
             </div>
             <div className="p-3 bg-slate-50 dark:bg-slate-800 text-xs text-slate-600 dark:text-slate-300 flex items-center justify-between">
-              <span>Saved format: .{previewModal.fileFormat}</span>
+              <span>Binary format: .{previewModal.fileFormat}</span>
               {previewModal.driveWebLink && (
                 <a
                   href={previewModal.driveWebLink}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-indigo-600 font-semibold hover:underline flex items-center gap-1"
+                  className="text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 font-semibold"
                 >
-                  Open in Google Drive <ExternalLink className="w-3.5 h-3.5" />
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open in Admin Google Drive</span>
                 </a>
               )}
             </div>

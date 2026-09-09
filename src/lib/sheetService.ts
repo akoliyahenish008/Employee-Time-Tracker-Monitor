@@ -3,6 +3,7 @@
  * - Manages or creates the master spreadsheet (stored in Admin's Drive or shared Drive)
  * - Automatically creates or switches to employee tab (e.g. "John Doe") or date tabs
  * - Correctly computes start, pause, stop and task switches
+ * - Logs employee signup/registration and login events into the Admin Master Sheet
  * - NEVER outputs "NaN": strictly calculates decimal hours and formats strings safely.
  */
 
@@ -61,6 +62,11 @@ export async function getOrCreateSpreadsheet(
             title: 'Overview_Summary',
           },
         },
+        {
+          properties: {
+            title: 'Registered_Staff',
+          },
+        },
       ],
     }),
   });
@@ -78,6 +84,11 @@ export async function getOrCreateSpreadsheet(
     ['Employee Name', 'Date', 'Task Name', 'Start Time', 'End / Switch Time', 'Duration', 'Hours (Decimal)', 'Status', 'Screenshots Uploaded', 'Avg Productivity']
   ]);
 
+  // Initialize header for Registered_Staff
+  await appendSheetRows(accessToken, spreadsheetId, 'Registered_Staff', [
+    ['Employee Name', 'Email Address', 'Role', 'Status', 'Created Date/Time', 'Last Active / Login Time']
+  ]);
+
   return spreadsheetId;
 }
 
@@ -89,10 +100,8 @@ export async function ensureSheetTab(
   spreadsheetId: string,
   tabTitle: string
 ): Promise<void> {
-  // Sanitize tab title (Google sheets allows up to 100 characters, no special chars like * : ? / \ [ ])
   const sanitizedTitle = tabTitle.replace(/[*?:/\\[\]]/g, '_').substring(0, 80);
 
-  // Fetch spreadsheet metadata to check if sheet already exists
   const metaRes = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`,
     {
@@ -131,14 +140,14 @@ export async function ensureSheetTab(
     }),
   });
 
-  // Append default headers
+  // Append default header to newly created employee tab
   await appendSheetRows(accessToken, spreadsheetId, sanitizedTitle, [
-    ['Date', 'Task Name', 'Start Time', 'End / Switch Time', 'Duration', 'Hours (Decimal)', 'Status', 'Screenshots Taken', 'Avg Productivity %'],
+    ['Date', 'Task Name', 'Start Time', 'End / Switch Time', 'Duration', 'Hours (Decimal)', 'Status', 'Screenshots Uploaded', 'Avg Productivity']
   ]);
 }
 
 /**
- * Appends row(s) to a specific tab
+ * Appends rows to a specific tab
  */
 export async function appendSheetRows(
   accessToken: string,
@@ -146,14 +155,10 @@ export async function appendSheetRows(
   tabTitle: string,
   rows: any[][]
 ): Promise<void> {
-  const sanitizedTitle = tabTitle.replace(/[*?:/\\[\]]/g, '_').substring(0, 80);
-  const range = `'${sanitizedTitle}'!A1`;
+  const sanitizedTab = tabTitle.replace(/[*?:/\\[\]]/g, '_').substring(0, 80);
+  const range = `${sanitizedTab}!A1`;
 
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(
-    range
-  )}:append?valueInputOption=USER_ENTERED`;
-
-  const res = await fetch(url, {
+  const res = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -214,4 +219,31 @@ export async function logTaskIntervalToSheet(
     log.productivityScore || '88%'
   ];
   await appendSheetRows(accessToken, spreadsheetId, 'Overview_Summary', [overviewRow]);
+}
+
+/**
+ * Record a new employee registration or login into the Registered_Staff sheet tab
+ */
+export async function logEmployeeRegistrationToSheet(
+  accessToken: string,
+  spreadsheetId: string,
+  employee: {
+    name: string;
+    email: string;
+    role: string;
+    createdAt?: string;
+    lastActive?: string;
+  }
+): Promise<void> {
+  await ensureSheetTab(accessToken, spreadsheetId, 'Registered_Staff');
+  const nowStr = new Date().toLocaleString();
+  const staffRow = [
+    employee.name,
+    employee.email,
+    employee.role,
+    'Approved & Active',
+    employee.createdAt || nowStr,
+    employee.lastActive || nowStr
+  ];
+  await appendSheetRows(accessToken, spreadsheetId, 'Registered_Staff', [staffRow]);
 }

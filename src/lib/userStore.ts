@@ -41,7 +41,8 @@ export const DEFAULT_STORAGE_SETTINGS: StorageSettings = {
   centralAdminEmail: 'henishcodestrokes@gmail.com',
   centralFolderName: 'WorkMonitor_Records',
   screenshotFormat: 'webp',
-  autoCaptureIntervalMinutes: 5,
+  autoCaptureIntervalMinutes: 7,
+  captureMode: 'random_5_to_10_min',
   spreadsheetName: 'Employee_Time_Tracking_Master',
 };
 

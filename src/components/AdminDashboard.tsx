@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AppUser, PendingSignup, StorageSettings } from '../types';
+import { AppUser, PendingSignup, StorageSettings, ScreenshotLog } from '../types';
 import {
   saveStoredUsers,
   savePendingSignups,
@@ -18,10 +18,12 @@ import {
   FileImage,
   RefreshCw,
   Search,
-  Calendar
+  Calendar,
+  Shuffle,
+  Mail,
+  Folder
 } from 'lucide-react';
 import { formatSecondsToHoursMinutes, secondsToDecimalHours } from '../lib/utils';
-import { ScreenshotLog } from '../types';
 
 interface AdminDashboardProps {
   adminUser: AppUser;
@@ -56,12 +58,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Settings form state
   const [destMode, setDestMode] = useState<'central_admin_drive' | 'individual_user_drive'>(
-    storageSettings.destinationMode
+    storageSettings.destinationMode || 'central_admin_drive'
   );
-  const [centralEmail, setCentralEmail] = useState(storageSettings.centralAdminEmail);
-  const [folderName, setFolderName] = useState(storageSettings.centralFolderName);
-  const [screenFormat, setScreenFormat] = useState<'webp' | 'png' | 'jpg'>(storageSettings.screenshotFormat);
-  const [sheetName, setSheetName] = useState(storageSettings.spreadsheetName);
+  const [centralEmail, setCentralEmail] = useState(storageSettings.centralAdminEmail || 'henishcodestrokes@gmail.com');
+  const [folderName, setFolderName] = useState(storageSettings.centralFolderName || 'WorkMonitor_Records');
+  const [screenFormat, setScreenFormat] = useState<'webp' | 'png' | 'jpg'>(storageSettings.screenshotFormat || 'webp');
+  const [captureMode, setCaptureMode] = useState<'random_5_to_10_min' | 'fixed_interval'>(
+    storageSettings.captureMode || 'random_5_to_10_min'
+  );
+  const [intervalMinutes, setIntervalMinutes] = useState<number>(storageSettings.autoCaptureIntervalMinutes || 7);
+  const [sheetName, setSheetName] = useState(storageSettings.spreadsheetName || 'Employee_Time_Tracking_Master');
   const [savedSuccessMsg, setSavedSuccessMsg] = useState('');
 
   // Handle Save Settings
@@ -72,11 +78,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       centralAdminEmail: centralEmail,
       centralFolderName: folderName,
       screenshotFormat: screenFormat,
+      captureMode: captureMode,
+      autoCaptureIntervalMinutes: intervalMinutes,
       spreadsheetName: sheetName,
     };
     onUpdateStorageSettings(updated);
     saveStorageSettings(updated);
-    setSavedSuccessMsg('Drive storage location and format settings saved successfully!');
+    setSavedSuccessMsg('Drive storage location, random capture mode, and Google Sheet config saved successfully!');
     setTimeout(() => setSavedSuccessMsg(''), 4000);
   };
 
@@ -93,10 +101,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     };
     const updatedUsers = [...allUsers, newUser];
     const updatedSignups = pendingSignups.filter((s) => s.id !== signup.id);
-
     onUpdateUsers(updatedUsers);
-    saveStoredUsers(updatedUsers);
     onUpdatePendingSignups(updatedSignups);
+    saveStoredUsers(updatedUsers);
     savePendingSignups(updatedSignups);
   };
 
@@ -113,14 +120,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   // Compute stats for each employee
   const employeeStats = employeesList.map((emp) => {
     const empScreens = allScreenshots.filter((s) => s.userId === emp.id);
-    // Rough estimate: each screenshot represents interval time or calculated logged work
-    const approximateSeconds = empScreens.length * (storageSettings.autoCaptureIntervalMinutes * 60);
+    const approximateSeconds = empScreens.length * ((storageSettings.autoCaptureIntervalMinutes || 7) * 60);
     return {
       ...emp,
       screenshotsCount: empScreens.length,
       estimatedHoursText: formatSecondsToHoursMinutes(approximateSeconds),
       decimalHours: secondsToDecimalHours(approximateSeconds),
-      monthTotalHours: (secondsToDecimalHours(approximateSeconds) + 14.5).toFixed(1), // Base recorded month hours + today
+      monthTotalHours: (secondsToDecimalHours(approximateSeconds) + 14.5).toFixed(1),
     };
   });
 
@@ -144,28 +150,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="flex items-center gap-2 text-indigo-400 text-xs font-semibold uppercase tracking-wider mb-1">
             <ShieldCheck className="w-4 h-4" /> Admin Console
           </div>
-          <h1 className="text-2xl font-bold text-slate-100">Team Activity & Storage Hub</h1>
+          <h1 className="text-2xl font-bold text-slate-100">Team Activity & Central Drive Hub</h1>
           <p className="text-sm text-slate-400 mt-1">
-            Logged in as <span className="font-semibold text-white">{adminUser.name}</span> ({adminUser.email})
+            Main Storage Admin: <span className="font-semibold text-white">{centralEmail}</span>
           </p>
         </div>
 
-        <div className="flex items-center gap-3">
-          {accessToken ? (
+        <div className="flex flex-wrap items-center gap-3">
+          {accessToken || storageSettings.adminAccessToken ? (
             <div className="flex items-center gap-2 bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-xs px-3.5 py-2 rounded-xl">
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span>Drive & Sheets Connected</span>
+              <span>Admin Drive & Sheets Connected</span>
             </div>
           ) : (
             <button
               id="admin-connect-google-btn"
               onClick={onConnectDrive}
-              className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-4 py-2.5 rounded-xl transition shadow"
+              className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium px-4 py-2.5 rounded-xl transition shadow cursor-pointer"
             >
               <FolderSync className="w-4 h-4" />
-              <span>Connect Admin Google Drive</span>
+              <span>Connect Admin Google Drive & Sheets</span>
             </button>
           )}
+
+          <button
+            onClick={onConnectDrive}
+            title="Reconnect or refresh Google Drive permissions"
+            className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-2 rounded-xl transition cursor-pointer border border-slate-700"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Re-Authorize Drive</span>
+          </button>
         </div>
       </div>
 
@@ -174,7 +189,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         <button
           id="tab-employees"
           onClick={() => setActiveTab('employees')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap cursor-pointer ${
             activeTab === 'employees'
               ? 'border-indigo-600 text-indigo-600 font-semibold'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -187,20 +202,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         <button
           id="tab-screenViewer"
           onClick={() => setActiveTab('screenViewer')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap cursor-pointer ${
             activeTab === 'screenViewer'
               ? 'border-indigo-600 text-indigo-600 font-semibold'
               : 'border-transparent text-slate-500 hover:text-slate-800'
           }`}
         >
           <FileImage className="w-4 h-4" />
-          <span>Hourly Screenshots & Date Logs ({allScreenshots.length})</span>
+          <span>Live Screenshots & Logs ({allScreenshots.length})</span>
         </button>
 
         <button
           id="tab-approvals"
           onClick={() => setActiveTab('approvals')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap cursor-pointer ${
             activeTab === 'approvals'
               ? 'border-indigo-600 text-indigo-600 font-semibold'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -218,14 +233,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         <button
           id="tab-storage"
           onClick={() => setActiveTab('storage')}
-          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+          className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap cursor-pointer ${
             activeTab === 'storage'
               ? 'border-indigo-600 text-indigo-600 font-semibold'
               : 'border-transparent text-slate-500 hover:text-slate-800'
           }`}
         >
           <HardDrive className="w-4 h-4" />
-          <span>Storage Location & Drive Config</span>
+          <span>Central Storage & Random Capture</span>
         </button>
       </div>
 
@@ -233,15 +248,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {activeTab === 'employees' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-slate-800">Active Employee Directory & Hours Log</h2>
+            <h2 className="text-lg font-bold text-slate-800 dark:text-white">Active Employee Directory & Hours Log</h2>
             <div className="text-xs text-slate-500">
-              Automatic sync to Google Sheet tab per employee name
+              All remote logins write into Admin Master Google Sheet under individual tabs
             </div>
           </div>
 
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden shadow-sm">
             <table className="w-full text-left text-sm">
-              <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+              <thead className="bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
                 <tr>
                   <th className="py-3 px-4">Employee</th>
                   <th className="py-3 px-4">Role / Status</th>
@@ -251,38 +266,40 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {employeeStats.map((emp) => (
-                  <tr key={emp.id} className="hover:bg-slate-50/70 transition">
-                    <td className="py-3.5 px-4">
-                      <div className="font-semibold text-slate-900">{emp.name}</div>
-                      <div className="text-xs text-slate-500">{emp.email}</div>
+                  <tr key={emp.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/50">
+                    <td className="py-3 px-4">
+                      <div className="font-semibold text-slate-900 dark:text-white">{emp.name}</div>
+                      <div className="text-xs text-slate-400">{emp.email}</div>
                     </td>
-                    <td className="py-3.5 px-4">
-                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Active
+                    <td className="py-3 px-4">
+                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300">
+                        Active Remote Staff
                       </span>
                     </td>
-                    <td className="py-3.5 px-4 text-slate-700 font-medium">
-                      {emp.screenshotsCount} captures
-                    </td>
-                    <td className="py-3.5 px-4">
-                      <span className="font-semibold text-indigo-700 bg-indigo-50 px-2 py-1 rounded">
-                        {emp.estimatedHoursText}
+                    <td className="py-3 px-4">
+                      <span className="font-mono font-medium text-indigo-600 dark:text-indigo-400">
+                        {emp.screenshotsCount} captures
                       </span>
                     </td>
-                    <td className="py-3.5 px-4 font-bold text-slate-800">
-                      {emp.monthTotalHours} hrs
+                    <td className="py-3 px-4">
+                      <span className="font-mono text-slate-700 dark:text-slate-300">{emp.estimatedHoursText}</span>
                     </td>
-                    <td className="py-3.5 px-4 text-right">
+                    <td className="py-3 px-4">
+                      <span className="font-mono font-bold text-slate-900 dark:text-white">
+                        {emp.monthTotalHours} hrs
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-right">
                       <button
                         onClick={() => {
                           setSelectedUserFilter(emp.id);
                           setActiveTab('screenViewer');
                         }}
-                        className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 hover:underline"
+                        className="text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-semibold cursor-pointer"
                       >
-                        Inspect Screenshots →
+                        View Screenshots &rarr;
                       </button>
                     </td>
                   </tr>
@@ -293,137 +310,135 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Tab 2: Hourly Screenshots & Whole Day Date Logs */}
+      {/* Tab 2: Live Hourly Screenshots Viewer */}
       {activeTab === 'screenViewer' && (
         <div className="space-y-4">
-          <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Employee Filter */}
               <div>
-                <h3 className="text-base font-bold text-slate-800">Screen Monitoring Gallery</h3>
-                <p className="text-xs text-slate-500">
-                  Screenshots are stored strictly in nested folders: <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-700">[User Name] / [YYYY-MM-DD] / image.{storageSettings.screenshotFormat}</code>
-                </p>
-              </div>
-
-              {/* Filters */}
-              <div className="flex flex-wrap items-center gap-3">
-                {/* Employee Filter */}
+                <label className="block text-[11px] font-semibold text-slate-500 uppercase">Employee</label>
                 <select
                   value={selectedUserFilter}
                   onChange={(e) => setSelectedUserFilter(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-slate-700"
+                  className="mt-0.5 text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-lg px-2.5 py-1.5 text-slate-800 dark:text-white"
                 >
-                  <option value="all">All Employees</option>
-                  {employeesList.map((e) => (
-                    <option key={e.id} value={e.id}>{e.name}</option>
+                  <option value="all">All Employees ({employeesList.length})</option>
+                  {employeesList.map((emp) => (
+                    <option key={emp.id} value={emp.id}>
+                      {emp.name}
+                    </option>
                   ))}
                 </select>
+              </div>
 
-                {/* Date Filter */}
+              {/* Date Filter */}
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-500 uppercase">Date Key</label>
                 <select
                   value={selectedDateFilter}
                   onChange={(e) => setSelectedDateFilter(e.target.value)}
-                  className="text-xs bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-slate-700"
+                  className="mt-0.5 text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-lg px-2.5 py-1.5 text-slate-800 dark:text-white"
                 >
                   <option value="all">All Dates</option>
-                  {availableDates.map((d) => (
-                    <option key={d} value={d}>{d}</option>
+                  {availableDates.map((date) => (
+                    <option key={date} value={date}>
+                      {date}
+                    </option>
                   ))}
                 </select>
               </div>
             </div>
 
-            {/* Hour Tabs Bar */}
-            <div className="border-t border-slate-100 pt-3">
-              <div className="text-xs font-semibold text-slate-500 mb-2">Hour-by-Hour Timeline Tabbing:</div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={() => setSelectedHourTab('all')}
-                  className={`px-3 py-1 text-xs rounded-lg font-medium transition ${
-                    selectedHourTab === 'all'
-                      ? 'bg-slate-900 text-white'
-                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                  }`}
-                >
-                  All Hours (Whole Day)
-                </button>
-                {availableHours.map((hourStr) => (
-                  <button
-                    key={hourStr}
-                    onClick={() => setSelectedHourTab(hourStr)}
-                    className={`px-3 py-1 text-xs rounded-lg font-medium transition ${
-                      selectedHourTab === hourStr
-                        ? 'bg-indigo-600 text-white'
-                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                    }`}
-                  >
-                    {hourStr}
-                  </button>
-                ))}
-              </div>
+            <div className="text-xs text-slate-500">
+              Showing <span className="font-bold text-slate-800 dark:text-white">{filteredScreenshots.length}</span> captures
             </div>
           </div>
 
-          {/* Screenshot Grid */}
+          {/* Hour Tabs */}
+          <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+            <button
+              onClick={() => setSelectedHourTab('all')}
+              className={`px-3 py-1.5 text-xs rounded-lg transition whitespace-nowrap cursor-pointer ${
+                selectedHourTab === 'all'
+                  ? 'bg-indigo-600 text-white font-bold'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
+              }`}
+            >
+              All Hours
+            </button>
+            {availableHours.map((hr) => (
+              <button
+                key={hr}
+                onClick={() => setSelectedHourTab(hr)}
+                className={`px-3 py-1.5 text-xs rounded-lg transition whitespace-nowrap cursor-pointer ${
+                  selectedHourTab === hr
+                    ? 'bg-indigo-600 text-white font-bold'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
+                }`}
+              >
+                {hr}
+              </button>
+            ))}
+          </div>
+
+          {/* Screenshots Grid */}
           {filteredScreenshots.length === 0 ? (
-            <div className="bg-slate-50 border border-dashed border-slate-200 rounded-xl p-12 text-center text-slate-500">
-              <FileImage className="w-10 h-10 mx-auto text-slate-300 mb-2" />
-              <div className="font-medium text-slate-700">No screenshots found for the selected filter</div>
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-12 text-center text-slate-500">
+              <FileImage className="w-8 h-8 mx-auto text-slate-400 mb-2" />
+              <div className="text-sm font-semibold">No screenshots found for this filter</div>
               <p className="text-xs text-slate-400 mt-1">
-                Start tracking in an employee session to capture live computer desktop activity into Drive.
+                Screenshots captured randomly every 5-10 minutes will appear here in real time.
               </p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {filteredScreenshots.map((item) => (
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+              {filteredScreenshots.map((screen) => (
                 <div
-                  key={item.id}
-                  className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm hover:shadow transition flex flex-col"
+                  key={screen.id}
+                  className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden shadow-sm hover:shadow-md transition flex flex-col"
                 >
                   <div
-                    className="relative cursor-pointer bg-slate-900 aspect-video overflow-hidden group"
-                    onClick={() => setPreviewImageModal(item)}
+                    onClick={() => setPreviewImageModal(screen)}
+                    className="relative cursor-pointer bg-slate-950 aspect-video group overflow-hidden"
                   >
                     <img
-                      src={item.previewDataUrl}
-                      alt={`Screen by ${item.userName}`}
-                      className="w-full h-full object-cover group-hover:scale-105 transition duration-300"
+                      src={screen.previewDataUrl}
+                      alt={screen.taskName}
+                      className="w-full h-full object-cover group-hover:scale-105 transition duration-200"
                     />
-                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-white text-xs font-semibold">
-                      Click to Enlarge ({item.fileFormat.toUpperCase()})
+                    <div className="absolute top-2 right-2 bg-black/70 text-white text-[10px] font-mono px-2 py-0.5 rounded">
+                      .{screen.fileFormat}
                     </div>
-                    <span className="absolute top-2 right-2 bg-slate-900/80 text-white text-[10px] uppercase font-bold px-1.5 py-0.5 rounded">
-                      .{item.fileFormat}
-                    </span>
+                    <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] font-medium px-2 py-0.5 rounded">
+                      {screen.timeFormatted}
+                    </div>
                   </div>
 
-                  <div className="p-3 flex-1 flex flex-col justify-between space-y-2">
+                  <div className="p-3 flex-1 flex flex-col justify-between">
                     <div>
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-bold text-slate-800 truncate">{item.userName}</span>
-                        <span className="text-slate-400 text-[11px]">{item.timeFormatted}</span>
+                      <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                        {screen.userName}
                       </div>
-                      <div className="text-xs text-indigo-600 font-medium truncate mt-0.5">
-                        Task: {item.taskName}
+                      <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                        {screen.taskName}
                       </div>
                     </div>
 
-                    <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
-                      <span className="flex items-center gap-1">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                        {item.dateKey}
-                      </span>
-                      {item.driveWebLink ? (
+                    <div className="mt-3 pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px]">
+                      <span className="text-slate-400 font-mono">{screen.dateKey}</span>
+                      {screen.driveWebLink ? (
                         <a
-                          href={item.driveWebLink}
+                          href={screen.driveWebLink}
                           target="_blank"
                           rel="noreferrer"
-                          className="text-indigo-600 hover:underline flex items-center gap-1"
+                          className="text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 font-semibold"
                         >
-                          Drive Link <ExternalLink className="w-3 h-3" />
+                          <HardDrive className="w-3 h-3" />
+                          <span>Admin Drive</span>
                         </a>
                       ) : (
-                        <span className="text-slate-400">Drive Syncing</span>
+                        <span className="text-emerald-600 dark:text-emerald-400 font-medium">Cloud Synced</span>
                       )}
                     </div>
                   </div>
@@ -434,61 +449,72 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Tab 3: Pending Employee Signup Approvals and Confirmation Codes */}
+      {/* Tab 3: Pending Sign-up Codes */}
       {activeTab === 'approvals' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-base font-bold text-slate-800">
-                Employee Registration Verification Codes
-              </h3>
-              <p className="text-xs text-slate-500">
-                When a new employee signs up, a 6-digit confirmation security code is dispatched to the admin here.
-                Admin can give this code to the employee or approve directly.
-              </p>
+            <h2 className="text-lg font-bold text-slate-800 dark:text-white">Security Sign-Up Code Approvals</h2>
+            <div className="text-xs text-slate-500">
+              Employees require this 6-digit confirmation code to register into the system
             </div>
           </div>
 
           {pendingSignups.length === 0 ? (
-            <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-slate-500">
-              <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
-              <div className="font-semibold text-slate-700">No Pending Employee Sign-Ups</div>
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-12 text-center text-slate-500">
+              <CheckCircle2 className="w-8 h-8 mx-auto text-emerald-500 mb-2" />
+              <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                No Pending Sign-Up Requests
+              </div>
               <p className="text-xs text-slate-400 mt-1">
-                All employee accounts have been confirmed and authorized.
+                When a new employee submits registration on another machine, their 6-digit code will appear here.
               </p>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {pendingSignups.map((s) => (
-                <div key={s.id} className="bg-white border-2 border-amber-200 rounded-xl p-4 shadow-sm space-y-3">
+              {pendingSignups.map((pending) => (
+                <div
+                  key={pending.id}
+                  className="bg-white dark:bg-slate-900 border border-amber-200 dark:border-amber-800 rounded-xl p-5 shadow-sm space-y-4"
+                >
                   <div className="flex items-start justify-between">
                     <div>
-                      <div className="font-bold text-slate-900 text-sm">{s.name}</div>
-                      <div className="text-xs text-slate-500">{s.email}</div>
+                      <div className="text-sm font-bold text-slate-900 dark:text-white">{pending.name}</div>
+                      <div className="text-xs text-slate-500">{pending.email}</div>
                       <div className="text-[11px] text-slate-400 mt-1">
-                        Requested: {new Date(s.timestamp).toLocaleTimeString()}
+                        Requested: {new Date(pending.timestamp).toLocaleTimeString()}
                       </div>
                     </div>
                     <div className="text-right">
-                      <div className="text-xs font-semibold text-slate-500">Verification Code:</div>
-                      <div className="text-xl font-mono font-bold tracking-widest text-indigo-700 bg-indigo-50 px-2 py-1 rounded mt-1 border border-indigo-200">
-                        {s.confirmationCode}
-                      </div>
+                      <span className="text-[10px] uppercase font-bold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/60 px-2 py-1 rounded">
+                        Action Required
+                      </span>
                     </div>
                   </div>
 
-                  <div className="pt-2 border-t border-slate-100 flex items-center justify-end gap-2">
+                  <div className="bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl p-3 text-center">
+                    <div className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                      Security Confirmation Code
+                    </div>
+                    <div className="text-2xl font-mono font-bold tracking-widest text-indigo-600 dark:text-indigo-400">
+                      {pending.confirmationCode}
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-1">
+                      Provide this 6-digit code to the employee to finalize registration
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3 pt-2">
                     <button
-                      onClick={() => handleRejectSignup(s.id)}
-                      className="px-3 py-1.5 text-xs text-rose-600 hover:bg-rose-50 rounded-lg font-medium transition"
+                      onClick={() => handleApproveSignup(pending)}
+                      className="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition shadow cursor-pointer"
                     >
-                      Reject
+                      Approve & Activate
                     </button>
                     <button
-                      onClick={() => handleApproveSignup(s)}
-                      className="px-4 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-medium transition shadow-sm"
+                      onClick={() => handleRejectSignup(pending.id)}
+                      className="py-2 px-3 border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 text-xs font-semibold rounded-lg hover:bg-slate-100 transition cursor-pointer"
                     >
-                      Directly Authorize & Approve
+                      Dismiss
                     </button>
                   </div>
                 </div>
@@ -498,36 +524,37 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       )}
 
-      {/* Tab 4: Storage Settings (Admin Only) */}
+      {/* Tab 4: Central Storage & Drive Configuration */}
       {activeTab === 'storage' && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm space-y-6">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-6">
           <div>
-            <h3 className="text-lg font-bold text-slate-800">Storage Architecture & Location Control</h3>
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+              Central Drive Storage & Capture Interval Policy
+            </h2>
             <p className="text-xs text-slate-500 mt-1">
-              Configure where employee screenshots and time logs are saved: either all consolidated in one Admin Email Drive,
-              or stored per individual employee's Drive. Only the administrator can view and modify these destination settings.
+              All remote employee screenshots, task intervals, and logs automatically funnel into your Admin Google Drive and Master Google Sheet. Employees do not need their own Google accounts.
             </p>
           </div>
 
           {savedSuccessMsg && (
-            <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-lg flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+            <div className="p-3 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 text-xs rounded-xl flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
               <span>{savedSuccessMsg}</span>
             </div>
           )}
 
-          <div className="space-y-4 max-w-2xl">
+          <div className="space-y-5">
             {/* Storage Destination Mode */}
             <div className="space-y-2">
-              <label className="text-xs font-bold text-slate-700 uppercase tracking-wide">
-                Storage Destination Architecture
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                Storage Destination Mode
               </label>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <label
-                  className={`p-3.5 border rounded-xl cursor-pointer transition flex flex-col justify-between ${
+                  className={`p-4 border rounded-xl cursor-pointer transition flex flex-col justify-between ${
                     destMode === 'central_admin_drive'
-                      ? 'border-indigo-600 bg-indigo-50/50 text-indigo-900 ring-2 ring-indigo-200'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      ? 'border-indigo-600 bg-indigo-50/50 dark:bg-indigo-950/40 text-indigo-900 dark:text-indigo-200 ring-2 ring-indigo-200'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                   }`}
                 >
                   <div className="flex items-center gap-2">
@@ -538,18 +565,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       onChange={() => setDestMode('central_admin_drive')}
                       className="text-indigo-600"
                     />
-                    <span className="text-xs font-bold">Consolidated Admin Drive (Single Location)</span>
+                    <span className="text-xs font-bold">Central Main Admin Drive (Enforced)</span>
                   </div>
-                  <p className="text-[11px] text-slate-500 mt-2">
-                    All employees' screenshots and logs flow into the single main Admin account's Drive.
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-2">
+                    Every employee's screenshots & hours funnel into your Admin Google Drive ({centralEmail}). Remote staff never need to connect their own Google account.
                   </p>
                 </label>
 
                 <label
-                  className={`p-3.5 border rounded-xl cursor-pointer transition flex flex-col justify-between ${
+                  className={`p-4 border rounded-xl cursor-pointer transition flex flex-col justify-between ${
                     destMode === 'individual_user_drive'
-                      ? 'border-indigo-600 bg-indigo-50/50 text-indigo-900 ring-2 ring-indigo-200'
-                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                      ? 'border-indigo-600 bg-indigo-50/50 dark:bg-indigo-950/40 text-indigo-900 dark:text-indigo-200 ring-2 ring-indigo-200'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                   }`}
                 >
                   <div className="flex items-center gap-2">
@@ -562,9 +589,78 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     />
                     <span className="text-xs font-bold">Individual Employee Drive</span>
                   </div>
-                  <p className="text-[11px] text-slate-500 mt-2">
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-2">
                     Each employee stores data into their respective authorized Google Drive.
                   </p>
+                </label>
+              </div>
+            </div>
+
+            {/* Random Screenshot Mode */}
+            <div className="p-4 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Shuffle className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  <span className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
+                    Automated Screenshot Trigger Policy
+                  </span>
+                </div>
+                <span className="text-[10px] font-bold bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded">
+                  Active
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label
+                  className={`p-3 border rounded-lg cursor-pointer transition ${
+                    captureMode === 'random_5_to_10_min'
+                      ? 'border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/40 text-indigo-950 dark:text-indigo-200 font-semibold'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="capturePolicy"
+                      checked={captureMode === 'random_5_to_10_min'}
+                      onChange={() => setCaptureMode('random_5_to_10_min')}
+                      className="text-indigo-600"
+                    />
+                    <span className="text-xs font-bold">Random Every 5 to 10 Minutes (Requested)</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 pl-5">
+                    Unpredictable randomized triggers between 5:00 and 10:00 minutes. Upon capture, timer resets for next randomized window.
+                  </p>
+                </label>
+
+                <label
+                  className={`p-3 border rounded-lg cursor-pointer transition ${
+                    captureMode === 'fixed_interval'
+                      ? 'border-indigo-600 bg-indigo-50/60 dark:bg-indigo-950/40 text-indigo-950 dark:text-indigo-200 font-semibold'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="radio"
+                      name="capturePolicy"
+                      checked={captureMode === 'fixed_interval'}
+                      onChange={() => setCaptureMode('fixed_interval')}
+                      className="text-indigo-600"
+                    />
+                    <span className="text-xs font-bold">Fixed Interval Capture</span>
+                  </div>
+                  <div className="mt-2 pl-5 flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={intervalMinutes}
+                      onChange={(e) => setIntervalMinutes(Number(e.target.value))}
+                      className="w-16 text-xs border border-slate-300 dark:border-slate-700 rounded px-2 py-1 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                    />
+                    <span className="text-xs text-slate-500">minutes</span>
+                  </div>
                 </label>
               </div>
             </div>
@@ -572,38 +668,40 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             {/* Central Admin Email */}
             {destMode === 'central_admin_drive' && (
               <div className="space-y-1">
-                <label className="text-xs font-semibold text-slate-700">Main Admin Storage Account Email</label>
+                <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                  Main Admin Storage Account Email
+                </label>
                 <input
                   type="email"
                   value={centralEmail}
                   onChange={(e) => setCentralEmail(e.target.value)}
-                  className="w-full text-xs border border-slate-300 rounded-lg px-3 py-2 text-slate-800"
-                  placeholder="admin@company.com"
+                  className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-lg px-3 py-2 text-slate-800 dark:text-white"
+                  placeholder="henishcodestrokes@gmail.com"
                 />
               </div>
             )}
 
             {/* Folder Hierarchy Configuration */}
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Root Drive Folder Name</label>
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">Root Drive Folder Name</label>
               <input
                 type="text"
                 value={folderName}
                 onChange={(e) => setFolderName(e.target.value)}
-                className="w-full text-xs border border-slate-300 rounded-lg px-3 py-2 text-slate-800"
+                className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-lg px-3 py-2 text-slate-800 dark:text-white"
                 placeholder="WorkMonitor_Records"
               />
-              <p className="text-[11px] text-slate-500">
-                Directory tree created: <code className="text-indigo-600">/{folderName}/[Employee_Name]/[YYYY-MM-DD]/capture.[ext]</code>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Directory tree in Admin Drive: <code className="text-indigo-600 font-mono">/{folderName}/[Employee_Name]/[YYYY-MM-DD]/capture.[ext]</code>
               </p>
             </div>
 
             {/* Screenshot Format */}
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Screenshot Binary File Format</label>
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">Screenshot Binary File Format</label>
               <div className="flex items-center gap-4">
                 {(['webp', 'png', 'jpg'] as const).map((fmt) => (
-                  <label key={fmt} className="flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+                  <label key={fmt} className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
                     <input
                       type="radio"
                       name="screenFormat"
@@ -617,29 +715,29 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 ))}
               </div>
               <p className="text-[11px] text-slate-400">
-                Screenshots will be converted and uploaded as binary images ({screenFormat.toUpperCase()}), not JSON files.
+                Screenshots will be uploaded as binary images ({screenFormat.toUpperCase()}) into your Google Drive folder.
               </p>
             </div>
 
             {/* Google Sheets Title */}
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-700">Master Google Spreadsheet Title</label>
+              <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">Master Google Spreadsheet Title</label>
               <input
                 type="text"
                 value={sheetName}
                 onChange={(e) => setSheetName(e.target.value)}
-                className="w-full text-xs border border-slate-300 rounded-lg px-3 py-2 text-slate-800"
+                className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-lg px-3 py-2 text-slate-800 dark:text-white"
                 placeholder="Employee_Time_Tracking_Master"
               />
-              <p className="text-[11px] text-slate-500">
-                Each employee automatically receives a dedicated tab in this sheet with precise start, pause, task change, and stop timestamps.
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Each employee automatically receives a dedicated tab in this sheet with start, stop, task change, and total hours.
               </p>
             </div>
 
             <div className="pt-3">
               <button
                 onClick={handleSaveSettings}
-                className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-5 py-2.5 rounded-xl transition shadow"
+                className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-5 py-2.5 rounded-xl transition shadow cursor-pointer"
               >
                 Save Storage Location & Configuration
               </button>
@@ -663,7 +761,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
               <button
                 onClick={() => setPreviewImageModal(null)}
-                className="text-slate-400 hover:text-slate-600 dark:hover:text-white text-sm font-semibold px-2 py-1"
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-white text-sm font-semibold px-2 py-1 cursor-pointer"
               >
                 Close ✕
               </button>
@@ -682,9 +780,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   href={previewImageModal.driveWebLink}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-indigo-600 font-semibold hover:underline flex items-center gap-1"
+                  className="text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 font-semibold"
                 >
-                  Open in Google Drive <ExternalLink className="w-3.5 h-3.5" />
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open in Google Drive</span>
                 </a>
               )}
             </div>
