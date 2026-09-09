@@ -6,6 +6,11 @@ import {
   saveStorageSettings,
 } from '../lib/userStore';
 import {
+  deleteUserFromFirestore,
+  deleteScreenshotsForUserFromFirestore,
+  syncUserToFirestore,
+} from '../lib/firebase';
+import {
   Users,
   HardDrive,
   Table,
@@ -23,10 +28,27 @@ import {
   Mail,
   Folder,
   Terminal,
-  Monitor
+  Monitor,
+  Trash2,
+  RotateCcw,
+  KeyRound,
+  Lock,
+  CheckSquare,
+  Square as SquareIcon,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { formatSecondsToHoursMinutes, secondsToDecimalHours } from '../lib/utils';
-import { provisionEmployeeWorkspace, verifyGoogleAccessToken } from '../lib/workspaceProvisioner';
+import {
+  provisionEmployeeWorkspace,
+  deprovisionEmployeeWorkspace,
+  verifyGoogleAccessToken,
+} from '../lib/workspaceProvisioner';
+import {
+  syncCredentialsToSheet,
+  updateUserPasswordInSheet,
+  getOrCreateSpreadsheet,
+} from '../lib/sheetService';
 
 interface AdminDashboardProps {
   adminUser: AppUser;
@@ -37,6 +59,7 @@ interface AdminDashboardProps {
   storageSettings: StorageSettings;
   onUpdateStorageSettings: (settings: StorageSettings) => void;
   allScreenshots: ScreenshotLog[];
+  onUpdateScreenshots?: (screens: ScreenshotLog[]) => void;
   accessToken: string | null;
   onConnectDrive: () => void;
 }
@@ -50,6 +73,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   storageSettings,
   onUpdateStorageSettings,
   allScreenshots,
+  onUpdateScreenshots,
   accessToken,
   onConnectDrive,
 }) => {
@@ -71,8 +95,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   );
   const [intervalMinutes, setIntervalMinutes] = useState<number>(storageSettings.autoCaptureIntervalMinutes || 7);
   const [intervalSeconds, setIntervalSeconds] = useState<number>(storageSettings.captureIntervalSeconds || 10);
+  const [allowedIntervals, setAllowedIntervals] = useState<number[]>(
+    storageSettings.allowedIntervals && storageSettings.allowedIntervals.length > 0
+      ? storageSettings.allowedIntervals
+      : [10, 20, 60, 120, 300, 600, 900]
+  );
+  const [lockIntervalForEmployees, setLockIntervalForEmployees] = useState<boolean>(
+    storageSettings.lockIntervalForEmployees !== false
+  );
   const [sheetName, setSheetName] = useState(storageSettings.spreadsheetName || 'Employee_Time_Tracking_Master');
   const [savedSuccessMsg, setSavedSuccessMsg] = useState('');
+
+  // User management & credentials state
+  const [deleteConfirmUser, setDeleteConfirmUser] = useState<AppUser | null>(null);
+  const [isDeletingUser, setIsDeletingUser] = useState<boolean>(false);
+  const [actionFeedback, setActionFeedback] = useState<string>('');
+  const [isSyncingCredentials, setIsSyncingCredentials] = useState<boolean>(false);
+  const [revealedPasswords, setRevealedPasswords] = useState<{ [userId: string]: boolean }>({});
 
   // Batch provisioning & Token testing states
   const [batchProvisionStatus, setBatchProvisionStatus] = useState<string>('');
@@ -80,6 +119,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [manualTokenInput, setManualTokenInput] = useState<string>('');
   const [tokenTestResult, setTokenTestResult] = useState<string>('');
   const [isTestingToken, setIsTestingToken] = useState<boolean>(false);
+
+  // Toggle allowed intervals checkbox
+  const handleToggleAllowedInterval = (sec: number) => {
+    setAllowedIntervals((prev) => {
+      if (prev.includes(sec)) {
+        if (prev.length <= 1) return prev; // Keep at least one
+        return prev.filter((s) => s !== sec);
+      } else {
+        return [...prev, sec].sort((a, b) => a - b);
+      }
+    });
+  };
 
   // Handle Save Settings
   const handleSaveSettings = () => {
@@ -92,12 +143,116 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       captureMode: captureMode,
       captureIntervalSeconds: intervalSeconds,
       autoCaptureIntervalMinutes: intervalMinutes,
+      allowedIntervals: allowedIntervals,
+      lockIntervalForEmployees: lockIntervalForEmployees,
       spreadsheetName: sheetName,
     };
     onUpdateStorageSettings(updated);
     saveStorageSettings(updated);
-    setSavedSuccessMsg('Drive storage location, capture intervals, and Google Sheet config saved successfully!');
+    setSavedSuccessMsg('Drive storage location, capture intervals policy, and Google Sheet config saved successfully!');
     setTimeout(() => setSavedSuccessMsg(''), 4000);
+  };
+
+  // RESET EMPLOYEE PASSWORD TO "admin123"
+  const handleResetEmployeePassword = async (employee: AppUser) => {
+    try {
+      const updatedUser: AppUser = {
+        ...employee,
+        password: 'admin123',
+        lastActive: new Date().toISOString(),
+      };
+
+      const updatedUsers = allUsers.map((u) => (u.id === employee.id ? updatedUser : u));
+      onUpdateUsers(updatedUsers);
+      saveStoredUsers(updatedUsers);
+      await syncUserToFirestore(updatedUser);
+
+      // Sync updated password into Google Sheet Employee_Credentials tab
+      const token = accessToken || storageSettings.adminAccessToken;
+      if (token) {
+        try {
+          const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+          await updateUserPasswordInSheet(token, spreadsheetId, updatedUser);
+        } catch (sheetErr) {
+          console.warn('Google Sheet password sync note on reset:', sheetErr);
+        }
+      }
+
+      setActionFeedback(`✅ Password for ${employee.name} reset to: admin123 and updated in Google Sheet.`);
+      setTimeout(() => setActionFeedback(''), 5000);
+    } catch (err: any) {
+      setActionFeedback(`❌ Failed to reset password: ${err.message}`);
+    }
+  };
+
+  // DELETE EMPLOYEE: Deletes user, their Drive folder, sheet tab, and screenshots
+  const handleDeleteEmployee = async (employee: AppUser) => {
+    setIsDeletingUser(true);
+    try {
+      // 1. Delete user from local store and Firestore
+      const updatedUsers = allUsers.filter((u) => u.id !== employee.id);
+      onUpdateUsers(updatedUsers);
+      saveStoredUsers(updatedUsers);
+      await deleteUserFromFirestore(employee.id);
+
+      // 2. Delete user's screenshots from local state and Firestore
+      if (onUpdateScreenshots) {
+        onUpdateScreenshots(allScreenshots.filter((s) => s.userId !== employee.id));
+      }
+      await deleteScreenshotsForUserFromFirestore(employee.id);
+
+      // 3. Delete user's Google Drive Folder & Google Sheet Tab
+      const token = accessToken || storageSettings.adminAccessToken;
+      if (token) {
+        try {
+          await deprovisionEmployeeWorkspace(
+            token,
+            employee,
+            storageSettings.spreadsheetName,
+            storageSettings.centralFolderName
+          );
+        } catch (driveErr) {
+          console.warn('Drive folder deletion note:', driveErr);
+        }
+
+        // 4. Synchronize the updated employee list in the Google Sheet Employee_Credentials tab
+        try {
+          const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+          await syncCredentialsToSheet(token, spreadsheetId, updatedUsers);
+        } catch (sheetErr) {
+          console.warn('Google Sheet credentials re-sync note:', sheetErr);
+        }
+      }
+
+      setActionFeedback(`✅ Employee ${employee.name}, their Google Drive folder, screenshots, and Sheet records were permanently deleted.`);
+      setTimeout(() => setActionFeedback(''), 5000);
+      setDeleteConfirmUser(null);
+    } catch (err: any) {
+      setActionFeedback(`❌ Error deleting employee: ${err.message}`);
+    } finally {
+      setIsDeletingUser(false);
+    }
+  };
+
+  // SYNC ALL USER CREDENTIALS TO GOOGLE SHEET
+  const handleSyncAllCredentials = async () => {
+    const token = accessToken || storageSettings.adminAccessToken;
+    if (!token) {
+      setActionFeedback('⚠️ Connect Google Drive first to sync passwords to Google Sheet.');
+      return;
+    }
+
+    setIsSyncingCredentials(true);
+    try {
+      const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+      await syncCredentialsToSheet(token, spreadsheetId, allUsers);
+      setActionFeedback(`✅ All ${allUsers.length} employee credentials and passwords successfully synchronized to the "Employee_Credentials" tab in your Google Sheet!`);
+      setTimeout(() => setActionFeedback(''), 5000);
+    } catch (err: any) {
+      setActionFeedback(`❌ Failed to sync credentials to sheet: ${err.message}`);
+    } finally {
+      setIsSyncingCredentials(false);
+    }
   };
 
   // Batch Provision All Employees in Google Drive and Master Google Sheet
@@ -326,10 +481,41 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       {/* Tab 1: Employees and Month Wise Total Hours */}
       {activeTab === 'employees' && (
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-slate-800 dark:text-white">Active Employee Directory & Hours Log</h2>
-            <div className="text-xs text-slate-500">
-              All remote logins write into Admin Master Google Sheet under individual tabs
+          {/* Action Feedback Toast */}
+          {actionFeedback && (
+            <div className="p-3.5 bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200 dark:border-indigo-800 text-indigo-900 dark:text-indigo-200 text-xs rounded-xl flex items-center justify-between shadow-sm">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-indigo-600 shrink-0" />
+                <span className="font-medium">{actionFeedback}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActionFeedback('')}
+                className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+              >
+                &times;
+              </button>
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-bold text-slate-800 dark:text-white">Active Employee Directory & Hours Log</h2>
+              <div className="text-xs text-slate-500">
+                All remote logins write into Admin Master Google Sheet under individual tabs and &quot;Employee_Credentials&quot; tab
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleSyncAllCredentials}
+                disabled={isSyncingCredentials}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-indigo-300 dark:border-indigo-700 bg-indigo-50 dark:bg-indigo-950/70 hover:bg-indigo-100 text-indigo-700 dark:text-indigo-300 text-xs font-semibold shadow-sm transition cursor-pointer disabled:opacity-50"
+              >
+                <Table className="w-3.5 h-3.5 text-indigo-600" />
+                <span>{isSyncingCredentials ? 'Syncing...' : 'Sync Passwords to Google Sheet'}</span>
+              </button>
             </div>
           </div>
 
@@ -338,54 +524,162 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <thead className="bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
                 <tr>
                   <th className="py-3 px-4">Employee</th>
+                  <th className="py-3 px-4">Password</th>
                   <th className="py-3 px-4">Role / Status</th>
-                  <th className="py-3 px-4">Today's Screenshots</th>
+                  <th className="py-3 px-4">Today&apos;s Screenshots</th>
                   <th className="py-3 px-4">Today Tracked Time</th>
                   <th className="py-3 px-4">Monthly Total Hours</th>
                   <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {employeeStats.map((emp) => (
-                  <tr key={emp.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/50">
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-900 dark:text-white">{emp.name}</div>
-                      <div className="text-xs text-slate-400">{emp.email}</div>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300">
-                        Active Remote Staff
-                      </span>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="font-mono font-medium text-indigo-600 dark:text-indigo-400">
-                        {emp.screenshotsCount} captures
-                      </span>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="font-mono text-slate-700 dark:text-slate-300">{emp.estimatedHoursText}</span>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="font-mono font-bold text-slate-900 dark:text-white">
-                        {emp.monthTotalHours} hrs
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 text-right">
-                      <button
-                        onClick={() => {
-                          setSelectedUserFilter(emp.id);
-                          setActiveTab('screenViewer');
-                        }}
-                        className="text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-semibold cursor-pointer"
-                      >
-                        View Screenshots &rarr;
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {employeeStats.map((emp) => {
+                  const isPasswordRevealed = !!revealedPasswords[emp.id];
+                  const userPassword = emp.password || 'admin123';
+
+                  return (
+                    <tr key={emp.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/50">
+                      <td className="py-3 px-4">
+                        <div className="font-semibold text-slate-900 dark:text-white">{emp.name}</div>
+                        <div className="text-xs text-slate-400">{emp.email}</div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <div className="flex items-center gap-2">
+                          <code className="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded text-slate-800 dark:text-slate-200">
+                            {isPasswordRevealed ? userPassword : '••••••••'}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRevealedPasswords((prev) => ({
+                                ...prev,
+                                [emp.id]: !prev[emp.id],
+                              }))
+                            }
+                            title={isPasswordRevealed ? 'Hide Password' : 'Show Password'}
+                            className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                          >
+                            {isPasswordRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300">
+                          Active Remote Staff
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="font-mono font-medium text-indigo-600 dark:text-indigo-400">
+                          {emp.screenshotsCount} captures
+                        </span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="font-mono text-slate-700 dark:text-slate-300">{emp.estimatedHoursText}</span>
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="font-mono font-bold text-slate-900 dark:text-white">
+                          {emp.monthTotalHours} hrs
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => {
+                              setSelectedUserFilter(emp.id);
+                              setActiveTab('screenViewer');
+                            }}
+                            className="text-xs text-indigo-600 dark:text-indigo-400 hover:underline font-semibold cursor-pointer"
+                          >
+                            Screenshots
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleResetEmployeePassword(emp)}
+                            title="Reset Password to admin123 and update Sheet"
+                            className="inline-flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/50 px-2 py-1 rounded border border-amber-200 dark:border-amber-800 font-medium cursor-pointer transition"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            <span>Reset (admin123)</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setDeleteConfirmUser(emp)}
+                            title="Permanently delete employee, folder, and screenshots"
+                            className="inline-flex items-center gap-1 text-xs text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/50 px-2 py-1 rounded border border-rose-200 dark:border-rose-800 font-medium cursor-pointer transition"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Delete</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
+
+          {/* Delete User Confirmation Modal */}
+          {deleteConfirmUser && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl animate-in fade-in zoom-in duration-150">
+                <div className="flex items-center gap-3 text-rose-600">
+                  <div className="p-2.5 bg-rose-100 dark:bg-rose-950/70 rounded-xl">
+                    <Trash2 className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                      Delete Employee & Work Records?
+                    </h3>
+                    <p className="text-xs text-slate-500">This action cannot be undone.</p>
+                  </div>
+                </div>
+
+                <div className="bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl p-3.5 text-xs text-slate-600 dark:text-slate-300 space-y-2">
+                  <div>
+                    Employee: <strong className="text-slate-900 dark:text-white">{deleteConfirmUser.name}</strong> ({deleteConfirmUser.email})
+                  </div>
+                  <ul className="list-disc pl-4 space-y-1 text-slate-500 dark:text-slate-400">
+                    <li>Removes user account from employee directory & database.</li>
+                    <li>Deletes Google Drive folder: <code className="font-mono text-rose-600">/{storageSettings.centralFolderName}/{deleteConfirmUser.name}/</code></li>
+                    <li>Deletes all associated screenshots and logs.</li>
+                    <li>Removes Google Sheet tab <code className="font-mono text-rose-600">[{deleteConfirmUser.name}]</code> & credentials entry.</li>
+                  </ul>
+                </div>
+
+                <div className="flex items-center justify-end gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setDeleteConfirmUser(null)}
+                    disabled={isDeletingUser}
+                    className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteEmployee(deleteConfirmUser)}
+                    disabled={isDeletingUser}
+                    className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-xl shadow-sm transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    {isDeletingUser ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Deleting User & Drive Folder...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Permanently Delete</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -675,24 +969,78 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             </div>
 
-            {/* Automated Screenshot Trigger Policy */}
-            <div className="p-4 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl space-y-3">
-              <div className="flex items-center justify-between">
+            {/* Automated Screenshot Trigger Policy with Multiple Checkboxes & Lock Setting */}
+            <div className="p-5 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-2xl space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <Shuffle className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
                   <span className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
-                    Automated Screenshot Trigger Intervals
+                    Automated Screenshot Capture Durations &amp; Policy
                   </span>
                 </div>
-                <span className="text-[10px] font-bold bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 px-2 py-0.5 rounded">
-                  {captureMode === 'random_5_to_10_min' ? 'Random (5-10m)' : `${intervalSeconds}s Interval`}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-bold bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 px-2.5 py-1 rounded-full flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    Active: {captureMode === 'random_5_to_10_min' ? 'Random (5–10m)' : `${intervalSeconds}s Interval`}
+                  </span>
+                </div>
               </div>
 
-              <div className="space-y-2">
-                <div className="text-xs text-slate-600 dark:text-slate-400">
-                  Select default screenshot interval policy for all workstations:
+              {/* Sub-section 1: Checkbox-Wise Multiple Duration Selection */}
+              <div className="space-y-2 pt-1 border-t border-slate-200 dark:border-slate-700">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                    Allowed Intervals (Checkbox Multi-Select):
+                  </label>
+                  <span className="text-[11px] text-slate-500">
+                    {allowedIntervals.length} interval durations enabled
+                  </span>
                 </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Select which interval options are authorized in your organization. If employee editing is unlocked, only these checked options will be available.
+                </p>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2.5 pt-1">
+                  {[
+                    { label: '10 sec (Test)', sec: 10 },
+                    { label: '20 sec (Test)', sec: 20 },
+                    { label: '30 sec', sec: 30 },
+                    { label: '1 min (60s)', sec: 60 },
+                    { label: '2 min (120s)', sec: 120 },
+                    { label: '5 min (300s)', sec: 300 },
+                    { label: '10 min (600s)', sec: 600 },
+                    { label: '15 min (900s)', sec: 900 },
+                    { label: '30 min (1800s)', sec: 1800 },
+                    { label: 'Random (5–10m)', sec: 420 },
+                  ].map((opt) => {
+                    const isChecked = allowedIntervals.includes(opt.sec);
+                    return (
+                      <label
+                        key={opt.sec}
+                        className={`flex items-center gap-2.5 p-2.5 rounded-xl border text-xs font-medium cursor-pointer transition select-none ${
+                          isChecked
+                            ? 'border-indigo-500 bg-indigo-50/70 dark:bg-indigo-950/60 text-indigo-950 dark:text-indigo-200'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 hover:bg-slate-100'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => handleToggleAllowedInterval(opt.sec)}
+                          className="w-4 h-4 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500 cursor-pointer"
+                        />
+                        <span>{opt.label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Sub-section 2: Active System Default Interval */}
+              <div className="space-y-2 pt-2 border-t border-slate-200 dark:border-slate-700">
+                <label className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Select Active Screenshot Interval (Applied to Workstations):
+                </label>
                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
                   {[
                     { label: '10 sec (Test)', sec: 10, mode: 'fixed_interval' as const },
@@ -712,7 +1060,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         setIntervalMinutes(Math.max(1, Math.round(opt.sec / 60)));
                       }}
                       className={`p-2.5 text-xs font-bold rounded-xl border transition cursor-pointer text-center ${
-                        (captureMode === opt.mode && (opt.mode === 'random_5_to_10_min' || intervalSeconds === opt.sec))
+                        captureMode === opt.mode && (opt.mode === 'random_5_to_10_min' || intervalSeconds === opt.sec)
                           ? 'border-indigo-600 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-950 dark:text-indigo-200 ring-2 ring-indigo-300'
                           : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:bg-slate-100'
                       }`}
@@ -721,6 +1069,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </button>
                   ))}
                 </div>
+              </div>
+
+              {/* Sub-section 3: Employee Access Restriction Checkbox */}
+              <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
+                <label className="flex items-start gap-3 p-3 bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={lockIntervalForEmployees}
+                    onChange={(e) => setLockIntervalForEmployees(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500 cursor-pointer shrink-0"
+                  />
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-bold text-amber-950 dark:text-amber-200 flex items-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                      <span>Lock capture duration for employees (Employees cannot access or modify interval)</span>
+                    </div>
+                    <p className="text-[11px] text-amber-800 dark:text-amber-300">
+                      When checked, employees will see the capture frequency as locked and enforced by admin policy. They cannot alter or tamper with the capture timing from their dashboard.
+                    </p>
+                  </div>
+                </label>
               </div>
             </div>
 
