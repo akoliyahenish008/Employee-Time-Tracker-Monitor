@@ -177,9 +177,22 @@ export default function App() {
     const unsubScreenshots = subscribeToScreenshots((cloudScreens) => {
       if (cloudScreens && cloudScreens.length > 0) {
         setScreenshots((prev) => {
-          const ids = new Set(cloudScreens.map(s => s.id));
-          const rest = prev.filter(p => !ids.has(p.id));
-          return [...cloudScreens, ...rest];
+          // If a cloud screenshot has a truncated or missing previewDataUrl, preserve the local pristine image
+          const localMap = new Map(prev.map((s) => [s.id, s]));
+          const sanitizedCloudScreens = cloudScreens.map((cs) => {
+            const local = localMap.get(cs.id);
+            if (
+              local &&
+              local.previewDataUrl &&
+              (!cs.previewDataUrl || cs.previewDataUrl.length === 50000)
+            ) {
+              return { ...cs, previewDataUrl: local.previewDataUrl };
+            }
+            return cs;
+          });
+          const ids = new Set(sanitizedCloudScreens.map((s) => s.id));
+          const rest = prev.filter((p) => !ids.has(p.id));
+          return [...sanitizedCloudScreens, ...rest];
         });
       }
     });
@@ -365,6 +378,7 @@ export default function App() {
             onConnectDrive={handleConnectGoogle}
             onNewScreenshot={handleNewScreenshot}
             userScreenshots={screenshots.filter((s) => s.userId === currentUser.id)}
+            onLogout={handleLogout}
           />
         )}
       </main>

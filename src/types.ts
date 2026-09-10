@@ -34,6 +34,7 @@ export interface ScreenshotLog {
   driveFileId?: string;
   driveFolderId?: string;
   driveWebLink?: string;
+  driveThumbnailLink?: string;
   previewDataUrl: string;
   productivityScore?: number; // 0-100
   productivityLabel?: 'High' | 'Normal' | 'Distracted';
@@ -80,4 +81,5 @@ export interface StorageSettings {
   adminTokenExpiry?: string;
   googleSpreadsheetId?: string;
   spreadsheetName: string;
+  showWorkspaceDiagnostics?: boolean; // Controls visibility of target drive info, manual capture button, and folder check button
 }

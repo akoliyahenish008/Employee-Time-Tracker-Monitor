@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { AppUser, PendingSignup, StorageSettings, ScreenshotLog } from '../types';
+import { ScreenshotViewerImage } from './ScreenshotViewerImage';
 import {
   saveStoredUsers,
   savePendingSignups,
@@ -103,6 +104,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [lockIntervalForEmployees, setLockIntervalForEmployees] = useState<boolean>(
     storageSettings.lockIntervalForEmployees !== false
   );
+  const [showWorkspaceDiagnostics, setShowWorkspaceDiagnostics] = useState<boolean>(
+    Boolean(storageSettings.showWorkspaceDiagnostics)
+  );
   const [sheetName, setSheetName] = useState(storageSettings.spreadsheetName || 'Employee_Time_Tracking_Master');
   const [savedSuccessMsg, setSavedSuccessMsg] = useState('');
 
@@ -145,6 +149,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       autoCaptureIntervalMinutes: intervalMinutes,
       allowedIntervals: allowedIntervals,
       lockIntervalForEmployees: lockIntervalForEmployees,
+      showWorkspaceDiagnostics: showWorkspaceDiagnostics,
       spreadsheetName: sheetName,
     };
     onUpdateStorageSettings(updated);
@@ -360,7 +365,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       screenshotsCount: empScreens.length,
       estimatedHoursText: formatSecondsToHoursMinutes(approximateSeconds),
       decimalHours: secondsToDecimalHours(approximateSeconds),
-      monthTotalHours: (secondsToDecimalHours(approximateSeconds) + 14.5).toFixed(1),
+      monthTotalHours: secondsToDecimalHours(approximateSeconds).toFixed(1),
     };
   });
 
@@ -775,15 +780,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     onClick={() => setPreviewImageModal(screen)}
                     className="relative cursor-pointer bg-slate-950 aspect-video group overflow-hidden"
                   >
-                    <img
-                      src={screen.previewDataUrl}
+                    <ScreenshotViewerImage
+                      screen={screen}
                       alt={screen.taskName}
-                      className="w-full h-full object-cover group-hover:scale-105 transition duration-200"
+                      className="group-hover:scale-105 transition duration-200"
                     />
-                    <div className="absolute top-2 right-2 bg-black/70 text-white text-[10px] font-mono px-2 py-0.5 rounded">
+                    <div className="absolute top-2 right-2 bg-black/75 backdrop-blur-xs text-white text-[10px] font-mono px-2 py-0.5 rounded shadow pointer-events-none">
                       .{screen.fileFormat}
                     </div>
-                    <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] font-medium px-2 py-0.5 rounded">
+                    <div className="absolute bottom-2 left-2 bg-black/75 backdrop-blur-xs text-white text-[10px] font-medium px-2 py-0.5 rounded shadow pointer-events-none">
                       {screen.timeFormatted}
                     </div>
                   </div>
@@ -1091,6 +1096,27 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   </div>
                 </label>
               </div>
+
+              {/* Sub-section 4: Workspace Diagnostics & Manual Tools Visibility */}
+              <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
+                <label className="flex items-start gap-3 p-3 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showWorkspaceDiagnostics}
+                    onChange={(e) => setShowWorkspaceDiagnostics(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500 cursor-pointer shrink-0"
+                  />
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                      <Monitor className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                      <span>Show Workspace Path Bar & Manual Capture Button for Employees</span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      When unchecked (default), employees see a clean, distraction-free view without the Target Drive bar, folder verification button, or manual camera button. Enable this anytime you need to test or inspect Drive folders with employees.
+                    </p>
+                  </div>
+                </label>
+              </div>
             </div>
 
             {/* Central Admin Email */}
@@ -1318,11 +1344,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 Close ✕
               </button>
             </div>
-            <div className="p-4 bg-slate-950 flex items-center justify-center max-h-[70vh] overflow-auto">
-              <img
-                src={previewImageModal.previewDataUrl}
+            <div className="p-4 bg-slate-950 flex items-center justify-center min-h-[320px] max-h-[70vh] overflow-auto">
+              <ScreenshotViewerImage
+                screen={previewImageModal}
                 alt="Enlarged desktop capture"
-                className="max-h-[65vh] w-auto object-contain rounded"
+                isModal={true}
+                className="max-h-[65vh] w-auto"
               />
             </div>
             <div className="p-3 bg-slate-50 dark:bg-slate-800 text-xs text-slate-600 dark:text-slate-300 flex items-center justify-between">

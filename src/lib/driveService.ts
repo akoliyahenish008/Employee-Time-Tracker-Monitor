@@ -14,6 +14,7 @@ export interface DriveUploadResult {
   fileId: string;
   fileName: string;
   webViewLink?: string;
+  thumbnailLink?: string;
 }
 
 /**
@@ -94,7 +95,7 @@ export async function uploadScreenshotToDrive(
   );
   form.append('file', imageBlob);
 
-  const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink';
+  const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,webContentLink,thumbnailLink';
   const res = await fetch(uploadUrl, {
     method: 'POST',
     headers: {
@@ -109,10 +110,26 @@ export async function uploadScreenshotToDrive(
   }
 
   const data = await res.json();
+
+  // Ensure file is readable so Drive thumbnail link displays seamlessly in the dashboard
+  try {
+    await fetch(`https://www.googleapis.com/drive/v3/files/${data.id}/permissions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ role: 'reader', type: 'anyone' }),
+    });
+  } catch (permErr) {
+    console.warn('Drive permission share note:', permErr);
+  }
+
   return {
     fileId: data.id,
     fileName: data.name,
     webViewLink: data.webViewLink,
+    thumbnailLink: data.thumbnailLink || `https://lh3.googleusercontent.com/d/${data.id}`,
   };
 }
 

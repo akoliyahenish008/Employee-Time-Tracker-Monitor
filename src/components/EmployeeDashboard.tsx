@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { AppUser, ScreenshotLog, StorageSettings } from '../types';
 import {
   Play,
@@ -30,7 +30,8 @@ import {
   KeyRound,
   Eye,
   EyeOff,
-  RotateCcw
+  RotateCcw,
+  SlidersHorizontal
 } from 'lucide-react';
 import {
   formatSecondsToHoursMinutes,
@@ -39,6 +40,7 @@ import {
   getTodayDateKey,
   getHourSlotKey,
   canvasToBlob,
+  generateThumbnailDataUrl,
 } from '../lib/utils';
 import {
   resolveEmployeeDateFolder,
@@ -54,6 +56,8 @@ import {
 import { provisionEmployeeWorkspace } from '../lib/workspaceProvisioner';
 import { logScreenshotToFirestore, syncUserToFirestore } from '../lib/firebase';
 import { getStoredUsers, saveStoredUsers } from '../lib/userStore';
+import { setCachedScreenshot } from '../lib/screenshotCache';
+import { ScreenshotViewerImage } from './ScreenshotViewerImage';
 
 interface EmployeeDashboardProps {
   currentUser: AppUser;
@@ -62,6 +66,7 @@ interface EmployeeDashboardProps {
   onConnectDrive: () => void;
   onNewScreenshot: (log: ScreenshotLog) => void;
   userScreenshots: ScreenshotLog[];
+  onLogout?: () => void;
 }
 
 export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
@@ -71,6 +76,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   onConnectDrive,
   onNewScreenshot,
   userScreenshots,
+  onLogout,
 }) => {
   const [taskName, setTaskName] = useState('Product Design & Implementation');
   const [isTracking, setIsTracking] = useState(false);
@@ -84,6 +90,20 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   const [driveUploadCount, setDriveUploadCount] = useState<number>(0);
   const [selectedHourTab, setSelectedHourTab] = useState<string>('all');
   const [previewModal, setPreviewModal] = useState<ScreenshotLog | null>(null);
+
+  // Hidden/Toggled Workspace Diagnostics & Tools (defaults to false/hidden)
+  const [showWorkspaceDiagnostics, setShowWorkspaceDiagnostics] = useState<boolean>(() => {
+    const local = localStorage.getItem('wm_show_diagnostics');
+    if (local !== null) return local === 'true';
+    return Boolean(storageSettings.showWorkspaceDiagnostics);
+  });
+
+  // Selected date for reviewing calculated hours & screenshot history
+  const [selectedDate, setSelectedDate] = useState<string>(getTodayDateKey());
+  const [showDateHistoryPanel, setShowDateHistoryPanel] = useState<boolean>(false);
+
+  // Persistent in-DOM video ref for actual desktop screen compositing
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
 
   // Next randomized or fixed capture countdown and timestamp
   const [selectedInterval, setSelectedInterval] = useState<number | 'random'>(
@@ -386,6 +406,56 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     }>
   >([]);
 
+  // Storage key for daily timer session persistence
+  const timerStorageKey = `wm_emp_timer_${currentUser.id}_${getTodayDateKey()}`;
+
+  // Restore accumulated daily hours on mount or reload (prevents reset on page refresh)
+  useEffect(() => {
+    try {
+      const savedRaw = localStorage.getItem(timerStorageKey);
+      if (savedRaw) {
+        const saved = JSON.parse(savedRaw);
+        if (typeof saved.dayTotalSeconds === 'number') {
+          let extra = 0;
+          if (saved.isTracking && !saved.isPaused && saved.lastUpdatedTimestamp) {
+            const diff = Math.floor((Date.now() - saved.lastUpdatedTimestamp) / 1000);
+            if (diff > 0 && diff < 3600) {
+              extra = diff;
+            }
+          }
+          const restoredDay = saved.dayTotalSeconds + extra;
+          const restoredSession = (saved.sessionSeconds || 0) + extra;
+          setDayTotalSeconds(restoredDay);
+          setSessionSeconds(restoredSession);
+          if (saved.taskName) setTaskName(saved.taskName);
+          if (saved.currentTaskStartTime) setCurrentTaskStartTime(saved.currentTaskStartTime);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to restore employee timer state:', e);
+    }
+  }, [currentUser.id, timerStorageKey]);
+
+  // Persist dayTotalSeconds and tracking state whenever it changes so refresh keeps it
+  useEffect(() => {
+    if (dayTotalSeconds > 0 || isTracking) {
+      try {
+        localStorage.setItem(
+          timerStorageKey,
+          JSON.stringify({
+            dayTotalSeconds,
+            sessionSeconds,
+            isTracking,
+            isPaused,
+            taskName,
+            currentTaskStartTime,
+            lastUpdatedTimestamp: Date.now(),
+          })
+        );
+      } catch {}
+    }
+  }, [dayTotalSeconds, sessionSeconds, isTracking, isPaused, taskName, currentTaskStartTime, timerStorageKey]);
+
   // Timer loop for tracking work duration
   useEffect(() => {
     if (isTracking && !isPaused) {
@@ -462,10 +532,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         videoTrack.onended = () => {
           setLastSyncStatus('Screen sharing stopped. Click "Resume" to restart whole-screen tracking.');
           screenStreamRef.current = null;
+          if (screenVideoRef.current) {
+            screenVideoRef.current.srcObject = null;
+          }
         };
       }
 
       screenStreamRef.current = stream;
+      if (screenVideoRef.current) {
+        screenVideoRef.current.srcObject = stream;
+        screenVideoRef.current.play().catch(() => {});
+      }
       setShowHidePopupTip(true);
       return stream;
     } catch (err: any) {
@@ -533,31 +610,17 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         return;
       }
 
-      const videoTrack = stream.getVideoTracks()[0];
-      const imageCapture = (window as any).ImageCapture
-        ? new (window as any).ImageCapture(videoTrack)
-        : null;
-
       const canvas = document.createElement('canvas');
-
-      if (imageCapture) {
-        try {
-          const bitmap = await imageCapture.grabFrame();
-          canvas.width = bitmap.width;
-          canvas.height = bitmap.height;
-          const ctx = canvas.getContext('2d');
-          ctx?.drawImage(bitmap, 0, 0);
-        } catch {
-          await captureViaVideoElement(stream, canvas);
-        }
-      } else {
-        await captureViaVideoElement(stream, canvas);
-      }
+      await captureFromVideoElement(screenVideoRef.current, stream, canvas);
 
       // Convert to requested binary format: webp, png, or jpg
       const format = storageSettings.screenshotFormat || 'webp';
       const { blob, mimeType, extension } = await canvasToBlob(canvas, format);
-      const previewDataUrl = canvas.toDataURL(mimeType, 0.5); // Lightweight preview for UI
+
+      // Generate pristine, lightweight thumbnail (~15-25KB) for UI & Firestore
+      const thumbnailDataUrl = generateThumbnailDataUrl(canvas, 640, 360, 0.75);
+      // Generate full-resolution local dataUrl for instant local preview modal
+      const fullLocalDataUrl = canvas.toDataURL(mimeType, 0.85);
 
       const now = new Date();
       const dateKey = getTodayDateKey(now);
@@ -571,6 +634,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
       let driveFileId: string | undefined;
       let driveWebLink: string | undefined;
+      let driveThumbnailLink: string | undefined;
 
       // Upload using central Admin's Google Drive OAuth token or current token
       const uploadToken = effectiveDriveToken;
@@ -596,6 +660,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
           driveFileId = uploadRes.fileId;
           driveWebLink = uploadRes.webViewLink;
+          driveThumbnailLink = uploadRes.thumbnailLink;
           setDriveUploadCount((c) => c + 1);
           setLastSyncStatus(`Saved to Admin Drive (${storageSettings.centralAdminEmail}): ${fileName}`);
 
@@ -627,9 +692,13 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         setLastSyncStatus(`Captured screen locally (.${extension}) & synced to Admin Live Database.`);
       }
 
-      // Log screenshot entry
+      const logId = `scr-${Date.now()}`;
+      // Cache pristine full-quality capture locally
+      setCachedScreenshot(logId, fullLocalDataUrl);
+
+      // Log screenshot entry (uses compact, high-contrast thumbnailDataUrl)
       const newLog: ScreenshotLog = {
-        id: `scr-${Date.now()}`,
+        id: logId,
         userId: currentUser.id,
         userName: currentUser.name,
         userEmail: currentUser.email,
@@ -641,7 +710,8 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         fileFormat: format,
         driveFileId,
         driveWebLink,
-        previewDataUrl,
+        driveThumbnailLink,
+        previewDataUrl: thumbnailDataUrl,
         productivityScore: 92,
         productivityLabel: 'High',
       };
@@ -651,29 +721,104 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       await logScreenshotToFirestore(newLog);
 
       // Trigger capture notification (toast, chime, desktop alert)
-      triggerCaptureNotification(newLog);
+      triggerCaptureNotification({
+        ...newLog,
+        previewDataUrl: fullLocalDataUrl,
+      });
     } catch (err: any) {
       console.error('Screenshot error:', err);
       setLastSyncStatus(`Capture warning: ${err.message}`);
     }
   };
 
-  const captureViaVideoElement = (
+  /**
+   * Captures the live desktop screen from the active video pipeline.
+   * Checks video element readiness and uses pixel sampling to avoid black frames.
+   */
+  const captureFromVideoElement = async (
+    videoEl: HTMLVideoElement | null,
     stream: MediaStream,
     canvas: HTMLCanvasElement
   ): Promise<void> => {
-    return new Promise((resolve) => {
-      const video = document.createElement('video');
-      video.srcObject = stream;
-      video.onloadedmetadata = () => {
-        video.play();
-        canvas.width = video.videoWidth || 1280;
-        canvas.height = video.videoHeight || 720;
-        const ctx = canvas.getContext('2d');
-        ctx?.drawImage(video, 0, 0, canvas.width, canvas.height);
-        resolve();
-      };
-    });
+    let activeVideo = videoEl;
+    let tempAppended = false;
+
+    if (!activeVideo) {
+      activeVideo = document.createElement('video');
+      activeVideo.muted = true;
+      activeVideo.playsInline = true;
+      activeVideo.autoplay = true;
+      activeVideo.style.position = 'fixed';
+      activeVideo.style.top = '-9999px';
+      activeVideo.style.left = '-9999px';
+      activeVideo.style.width = '320px';
+      activeVideo.style.height = '180px';
+      activeVideo.style.opacity = '0.001';
+      activeVideo.style.pointerEvents = 'none';
+      document.body.appendChild(activeVideo);
+      tempAppended = true;
+    }
+
+    if (activeVideo.srcObject !== stream) {
+      activeVideo.srcObject = stream;
+    }
+
+    try {
+      await activeVideo.play();
+    } catch {}
+
+    // Wait until video has dimensions and decoded first frame
+    let attempts = 0;
+    while ((!activeVideo.videoWidth || activeVideo.videoWidth === 0) && attempts < 20) {
+      await new Promise((r) => setTimeout(r, 80));
+      attempts++;
+    }
+
+    const width = activeVideo.videoWidth || 1920;
+    const height = activeVideo.videoHeight || 1080;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+
+    // Pixel sampling to detect unrendered or black frames
+    const isCanvasAllBlack = (c: CanvasRenderingContext2D, w: number, h: number): boolean => {
+      try {
+        const samples = [
+          [Math.floor(w * 0.2), Math.floor(h * 0.2)],
+          [Math.floor(w * 0.5), Math.floor(h * 0.2)],
+          [Math.floor(w * 0.8), Math.floor(h * 0.2)],
+          [Math.floor(w * 0.3), Math.floor(h * 0.5)],
+          [Math.floor(w * 0.5), Math.floor(h * 0.5)],
+          [Math.floor(w * 0.7), Math.floor(h * 0.5)],
+          [Math.floor(w * 0.2), Math.floor(h * 0.8)],
+          [Math.floor(w * 0.5), Math.floor(h * 0.8)],
+          [Math.floor(w * 0.8), Math.floor(h * 0.8)],
+        ];
+        for (const [x, y] of samples) {
+          const pixel = c.getImageData(x, y, 1, 1).data;
+          if (pixel[0] > 6 || pixel[1] > 6 || pixel[2] > 6) {
+            return false;
+          }
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (ctx) {
+      for (let tryIdx = 0; tryIdx < 4; tryIdx++) {
+        ctx.drawImage(activeVideo, 0, 0, width, height);
+        if (!isCanvasAllBlack(ctx, width, height)) {
+          break; // Real visible desktop image captured!
+        }
+        await new Promise((r) => setTimeout(r, 180));
+      }
+    }
+
+    if (tempAppended && activeVideo.parentNode) {
+      activeVideo.parentNode.removeChild(activeVideo);
+    }
   };
 
   /**
@@ -796,13 +941,26 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
       },
     ]);
 
+    // Clear persisted daily timer in localStorage so next session begins at 0h 0m
+    try {
+      localStorage.removeItem(timerStorageKey);
+    } catch {}
     setSessionSeconds(0);
-    setLastSyncStatus(`Tracking stopped at ${stopTimeStr}. Total logged.`);
+    setDayTotalSeconds(0);
+    setLastSyncStatus(`Tracking stopped at ${stopTimeStr}. Shift ended & logged out.`);
 
     // Release screen stream
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach((track) => track.stop());
       screenStreamRef.current = null;
+    }
+    if (screenVideoRef.current) {
+      screenVideoRef.current.srcObject = null;
+    }
+
+    // Call onLogout to cleanly log out employee
+    if (onLogout) {
+      onLogout();
     }
   };
 
@@ -869,13 +1027,66 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     setLastSyncStatus(`Switched to '${newTaskName.trim()}' at ${switchTimeStr}`);
   };
 
-  // Hour tabs for employee
-  const availableHours = Array.from(new Set(userScreenshots.map((s) => s.hourKey))).sort();
+  // Distinct dates with screenshots or activity for this employee
+  const availableDates = useMemo(() => {
+    const dates = new Set([getTodayDateKey(), ...userScreenshots.map((s) => s.dateKey)]);
+    return Array.from(dates).sort().reverse();
+  }, [userScreenshots]);
 
-  const filteredScreenshots = userScreenshots.filter((s) => {
-    if (selectedHourTab === 'all') return true;
-    return s.hourKey === selectedHourTab;
-  });
+  // Date-wise hours calculation: shows employee exactly how many hours are calculated for each date
+  const dateWiseStats = useMemo(() => {
+    return availableDates.map((dKey) => {
+      const screensOnDate = userScreenshots.filter((s) => s.dateKey === dKey);
+      let calculatedSec = 0;
+      if (dKey === getTodayDateKey()) {
+        // Today reflects live accumulated timer duration
+        calculatedSec = dayTotalSeconds;
+        const fromScreens = screensOnDate.length * (Number(storageSettings.captureIntervalSeconds) || 60);
+        if (fromScreens > calculatedSec) {
+          calculatedSec = fromScreens;
+        }
+      } else {
+        // Historical dates: calculated accurately from screenshots interval
+        const avgInterval = storageSettings.captureMode === 'random_5_to_10_min' ? 450 : (Number(storageSettings.captureIntervalSeconds) || 300);
+        calculatedSec = screensOnDate.length * avgInterval;
+      }
+      return {
+        dateKey: dKey,
+        isToday: dKey === getTodayDateKey(),
+        seconds: calculatedSec,
+        formattedHours: formatSecondsToHoursMinutes(calculatedSec),
+        decimalHours: secondsToDecimalHours(calculatedSec),
+        screenshotsCount: screensOnDate.length,
+      };
+    });
+  }, [availableDates, userScreenshots, dayTotalSeconds, storageSettings]);
+
+  // Current selected date statistics
+  const activeDateStat = dateWiseStats.find((d) => d.dateKey === selectedDate) || {
+    dateKey: selectedDate,
+    isToday: selectedDate === getTodayDateKey(),
+    seconds: selectedDate === getTodayDateKey() ? dayTotalSeconds : 0,
+    formattedHours: formatSecondsToHoursMinutes(selectedDate === getTodayDateKey() ? dayTotalSeconds : 0),
+    decimalHours: secondsToDecimalHours(selectedDate === getTodayDateKey() ? dayTotalSeconds : 0),
+    screenshotsCount: userScreenshots.filter((s) => s.dateKey === selectedDate).length,
+  };
+
+  // Screenshots filtered by active date
+  const dateScreenshots = useMemo(() => {
+    return userScreenshots.filter((s) => s.dateKey === selectedDate);
+  }, [userScreenshots, selectedDate]);
+
+  // Hour tabs for the selected date
+  const availableHours = useMemo(() => {
+    return Array.from(new Set(dateScreenshots.map((s) => s.hourKey))).sort();
+  }, [dateScreenshots]);
+
+  const filteredScreenshots = useMemo(() => {
+    return dateScreenshots.filter((s) => {
+      if (selectedHourTab === 'all') return true;
+      return s.hourKey === selectedHourTab;
+    });
+  }, [dateScreenshots, selectedHourTab]);
 
   return (
     <div className="w-full max-w-7xl mx-auto space-y-6">
@@ -949,7 +1160,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                     .filter((item) => {
                       if (!storageSettings.allowedIntervals || storageSettings.allowedIntervals.length === 0) return true;
                       if (item.val === 'random') return storageSettings.allowedIntervals.includes(420);
-                      return storageSettings.allowedIntervals.includes(item.val);
+                      return typeof item.val === 'number' && storageSettings.allowedIntervals.includes(item.val);
                     })
                     .map((item) => (
                       <button
@@ -1044,164 +1255,333 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   <span>Stop & Log Out</span>
                 </button>
 
-                <button
-                  id="btn-manual-capture"
-                  onClick={() => captureAndUploadScreen()}
-                  title="Capture Screen Now & Reset Timer"
-                  className="p-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl transition cursor-pointer"
-                >
-                  <Camera className="w-4 h-4" />
-                </button>
+                {showWorkspaceDiagnostics && (
+                  <button
+                    id="btn-manual-capture"
+                    onClick={() => captureAndUploadScreen()}
+                    title="Capture Screen Now & Reset Timer"
+                    className="p-3 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl transition cursor-pointer"
+                  >
+                    <Camera className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             )}
           </div>
         </div>
 
-        {/* Central Storage Destination Bar & Workspace Verification */}
-        <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5 text-xs">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
-              <Monitor className="w-4 h-4 text-indigo-500" />
-              <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
-              <span>&bull;</span>
-              <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
-              <span>&bull;</span>
-              <span>Sheet Tab: <strong className="font-mono text-slate-800 dark:text-slate-200">[{currentUser.name}]</strong> in <strong className="text-slate-800 dark:text-slate-200">{storageSettings.spreadsheetName}</strong></span>
-            </div>
+        {/* Quick Utilities Toolbar: Alerts, Password Settings, and Diagnostics Toggle */}
+        <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Notification Preferences Popover Button */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowNotificationSettings(!showNotificationSettings)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition cursor-pointer ${
+                  soundAlerts || desktopAlerts
+                    ? 'border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300'
+                    : 'border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-500'
+                }`}
+                title="Configure Screen Capture Notifications"
+              >
+                <Bell className="w-3.5 h-3.5" />
+                <span>Alerts: {soundAlerts && desktopAlerts ? 'Sound + Desktop' : soundAlerts ? 'Chime Active' : desktopAlerts ? 'Desktop Active' : 'Muted'}</span>
+              </button>
 
-            <div className="flex items-center gap-2">
-              {/* Notification Preferences Popover Button */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setShowNotificationSettings(!showNotificationSettings)}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition cursor-pointer ${
-                    soundAlerts || desktopAlerts
-                      ? 'border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300'
-                      : 'border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-500'
-                  }`}
-                  title="Configure Screen Capture Notifications"
-                >
-                  <Bell className="w-3.5 h-3.5" />
-                  <span>Alerts: {soundAlerts && desktopAlerts ? 'Sound + Desktop' : soundAlerts ? 'Chime Active' : desktopAlerts ? 'Desktop Active' : 'Muted'}</span>
-                </button>
+              {showNotificationSettings && (
+                <div className="absolute left-0 bottom-full mb-2 w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3.5 shadow-2xl z-40 space-y-3">
+                  <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+                    <span className="text-xs font-bold text-slate-800 dark:text-white flex items-center gap-1.5">
+                      <BellRing className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Capture Alerts</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowNotificationSettings(false)}
+                      className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-xs p-1 cursor-pointer"
+                    >
+                      ✕
+                    </button>
+                  </div>
 
-                {showNotificationSettings && (
-                  <div className="absolute right-0 bottom-full mb-2 w-72 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-3.5 shadow-2xl z-40 space-y-3">
-                    <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
-                      <span className="text-xs font-bold text-slate-800 dark:text-white flex items-center gap-1.5">
-                        <BellRing className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Capture Alerts</span>
-                      </span>
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                        {soundAlerts ? <Volume2 className="w-3.5 h-3.5 text-emerald-600" /> : <VolumeX className="w-3.5 h-3.5 text-slate-400" />}
+                        <span>Audio chime on capture</span>
+                      </div>
                       <button
                         type="button"
-                        onClick={() => setShowNotificationSettings(false)}
-                        className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 text-xs p-1 cursor-pointer"
+                        onClick={toggleSoundAlerts}
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
+                          soundAlerts
+                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                            : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                        }`}
                       >
-                        ✕
+                        {soundAlerts ? 'ON' : 'OFF'}
                       </button>
                     </div>
 
-                    <div className="space-y-2.5">
-                      <div className="flex items-center justify-between">
-                        <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
-                          {soundAlerts ? <Volume2 className="w-3.5 h-3.5 text-emerald-600" /> : <VolumeX className="w-3.5 h-3.5 text-slate-400" />}
-                          <span>Audio chime on capture</span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={toggleSoundAlerts}
-                          className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
-                            soundAlerts
-                              ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
-                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
-                          }`}
-                        >
-                          {soundAlerts ? 'ON' : 'OFF'}
-                        </button>
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                        <Monitor className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>Desktop browser notification</span>
                       </div>
-
-                      <div className="flex items-center justify-between">
-                        <div className="text-xs text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
-                          <Monitor className="w-3.5 h-3.5 text-indigo-600" />
-                          <span>Desktop browser notification</span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={toggleDesktopAlerts}
-                          className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
-                            desktopAlerts
-                              ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300'
-                              : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
-                          }`}
-                        >
-                          {desktopAlerts ? 'ON' : 'ENABLE'}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px] text-slate-500">
-                      <span>In-app visual toast</span>
-                      <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Active</span>
+                      <button
+                        type="button"
+                        onClick={toggleDesktopAlerts}
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-bold cursor-pointer transition ${
+                          desktopAlerts
+                            ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300'
+                            : 'bg-slate-100 text-slate-500 dark:bg-slate-800'
+                        }`}
+                      >
+                        {desktopAlerts ? 'ON' : 'ENABLE'}
+                      </button>
                     </div>
                   </div>
-                )}
+
+                  <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px] text-slate-500">
+                    <span>In-app visual toast</span>
+                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">Active</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setShowPasswordModal(true);
+                setPasswordStatusMsg('');
+                setPasswordErrorMsg('');
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold shadow-xs transition cursor-pointer"
+              title="Change password or reset to admin123"
+            >
+              <KeyRound className="w-3.5 h-3.5 text-amber-500" />
+              <span>Password Settings</span>
+            </button>
+          </div>
+
+          {/* Diagnostics UI Toggle: Allows employee or admin to check Drive paths when needed */}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                const next = !showWorkspaceDiagnostics;
+                setShowWorkspaceDiagnostics(next);
+                localStorage.setItem('wm_show_diagnostics', String(next));
+              }}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold transition cursor-pointer ${
+                showWorkspaceDiagnostics
+                  ? 'border-indigo-300 bg-indigo-50 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300'
+                  : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+              }`}
+              title="Toggle Target Drive path and workspace verification options"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <span>{showWorkspaceDiagnostics ? 'Diagnostics Tools: On' : 'Diagnostics Tools'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Central Storage Destination Bar & Workspace Verification: HIDDEN BY DEFAULT, SHOWN WHEN ENABLED */}
+        {showWorkspaceDiagnostics && (
+          <div className="mt-3 pt-3 border-t border-dashed border-slate-200 dark:border-slate-800 space-y-2.5 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
+                <Monitor className="w-4 h-4 text-indigo-500" />
+                <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
+                <span>&bull;</span>
+                <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
+                <span>&bull;</span>
+                <span>Sheet Tab: <strong className="font-mono text-slate-800 dark:text-slate-200">[{currentUser.name}]</strong> in <strong className="text-slate-800 dark:text-slate-200">{storageSettings.spreadsheetName}</strong></span>
               </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setShowPasswordModal(true);
-                  setPasswordStatusMsg('');
-                  setPasswordErrorMsg('');
-                }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold shadow-xs transition cursor-pointer"
-                title="Change password or reset to admin123"
-              >
-                <KeyRound className="w-3.5 h-3.5 text-amber-500" />
-                <span>Password Settings</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleProvisionWorkspace(true)}
+                  disabled={isProvisioning}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
+                >
+                  <HardDrive className="w-3.5 h-3.5 text-indigo-500" />
+                  <span>{isProvisioning ? 'Verifying...' : 'Check / Create Drive Folder & Sheet Tab'}</span>
+                </button>
+              </div>
+            </div>
 
+            {workspaceStatus && (
+              <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 rounded-xl text-xs flex items-center gap-2 font-medium">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{workspaceStatus}</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Whole Screen Active Guidance & Stop Sharing Removal Guide */}
+        <div className="mt-3 p-3 bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex items-center gap-2 text-indigo-900 dark:text-indigo-200">
+            <Monitor className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+            <span>
+              <strong>Whole-Screen Capture:</strong> To hide the Chrome <em>"sharing your screen"</em> popup bar, click the <strong>[Hide]</strong> button right next to "Stop sharing".
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowSilentGuideModal(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-sm transition cursor-pointer"
+            >
+              <Terminal className="w-3.5 h-3.5" />
+              <span>Remove Popups & Silent PC Setup</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Date-Wise Hours Summary & Date Inspector ("user also see him date how much hr calculate") */}
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-4 h-4 text-indigo-600" />
+            <span className="text-sm font-bold text-slate-800 dark:text-slate-100">
+              Work Date & Calculated Hours:
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowDateHistoryPanel(!showDateHistoryPanel)}
+            className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1 cursor-pointer"
+          >
+            <span>{showDateHistoryPanel ? '▲ Hide Date Breakdown' : '▼ View All Dates History'}</span>
+          </button>
+        </div>
+
+        {/* Date Selector Pills */}
+        <div className="flex items-center gap-2 overflow-x-auto pb-1">
+          {availableDates.map((dKey) => {
+            const isCurrent = dKey === selectedDate;
+            const stat = dateWiseStats.find((s) => s.dateKey === dKey);
+            return (
               <button
-                type="button"
-                onClick={() => handleProvisionWorkspace(true)}
-                disabled={isProvisioning}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
+                key={dKey}
+                onClick={() => {
+                  setSelectedDate(dKey);
+                  setSelectedHourTab('all');
+                }}
+                className={`px-3.5 py-2 rounded-xl text-xs font-medium transition cursor-pointer flex items-center gap-2 whitespace-nowrap ${
+                  isCurrent
+                    ? 'bg-indigo-600 text-white shadow-sm font-bold'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
+                }`}
               >
-                <HardDrive className="w-3.5 h-3.5 text-indigo-500" />
-                <span>{isProvisioning ? 'Verifying...' : 'Check / Create Drive Folder & Sheet Tab'}</span>
+                <span>{dKey === getTodayDateKey() ? `Today (${dKey})` : dKey}</span>
+                <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold ${
+                  isCurrent ? 'bg-indigo-700 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200'
+                }`}>
+                  {stat?.formattedHours || '0m'}
+                </span>
               </button>
+            );
+          })}
+        </div>
+
+        {/* Calculated Hours Metric Cards for the Selected Date */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-3.5 bg-slate-50 dark:bg-slate-800/60 rounded-xl border border-slate-200/60 dark:border-slate-700/60">
+          <div>
+            <div className="text-[11px] text-slate-500 font-medium uppercase tracking-wider">Inspected Date</div>
+            <div className="text-sm font-bold text-slate-900 dark:text-white mt-0.5 flex items-center gap-1.5">
+              <span>{selectedDate === getTodayDateKey() ? `Today (${selectedDate})` : selectedDate}</span>
+              {selectedDate === getTodayDateKey() && (
+                <span className="text-[10px] bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 font-bold px-1.5 py-0.2 rounded">
+                  Live Shift
+                </span>
+              )}
             </div>
           </div>
 
-          {workspaceStatus && (
-            <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 rounded-xl text-xs flex items-center gap-2 font-medium">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-              <span>{workspaceStatus}</span>
+          <div>
+            <div className="text-[11px] text-slate-500 font-medium uppercase tracking-wider">Calculated Work Duration</div>
+            <div className="text-sm font-mono font-bold text-indigo-600 dark:text-indigo-400 mt-0.5">
+              {activeDateStat.formattedHours} <span className="text-xs text-slate-500 font-normal">({activeDateStat.decimalHours} decimal hrs)</span>
             </div>
-          )}
+          </div>
 
-          {/* Whole Screen Active Guidance & Stop Sharing Removal Guide */}
-          <div className="p-3 bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2.5">
-            <div className="flex items-center gap-2 text-indigo-900 dark:text-indigo-200">
-              <Monitor className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
-              <span>
-                <strong>Whole-Screen Capture:</strong> To hide the Chrome <em>"sharing your screen"</em> popup bar, click the <strong>[Hide]</strong> button right next to "Stop sharing".
-              </span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setShowSilentGuideModal(true)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-sm transition cursor-pointer"
-              >
-                <Terminal className="w-3.5 h-3.5" />
-                <span>Remove Popups & Silent PC Setup</span>
-              </button>
+          <div>
+            <div className="text-[11px] text-slate-500 font-medium uppercase tracking-wider">Screenshots Captured</div>
+            <div className="text-sm font-semibold text-slate-800 dark:text-slate-200 mt-0.5">
+              {activeDateStat.screenshotsCount} captures taken
             </div>
           </div>
         </div>
+
+        {/* Expanded Date-Wise History Table */}
+        {showDateHistoryPanel && (
+          <div className="pt-3 border-t border-slate-100 dark:border-slate-800 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="text-slate-400 border-b border-slate-100 dark:border-slate-800">
+                  <th className="py-2 px-3">Date</th>
+                  <th className="py-2 px-3">Calculated Hours</th>
+                  <th className="py-2 px-3">Decimal Hours</th>
+                  <th className="py-2 px-3">Captures</th>
+                  <th className="py-2 px-3">Status</th>
+                  <th className="py-2 px-3 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                {dateWiseStats.map((stat) => (
+                  <tr
+                    key={stat.dateKey}
+                    className={`hover:bg-slate-50 dark:hover:bg-slate-800/50 ${
+                      stat.dateKey === selectedDate ? 'bg-indigo-50/50 dark:bg-indigo-950/30' : ''
+                    }`}
+                  >
+                    <td className="py-2.5 px-3 font-semibold text-slate-800 dark:text-slate-200">
+                      {stat.dateKey} {stat.isToday && <span className="text-[10px] text-emerald-600 font-bold ml-1">(Today)</span>}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono font-bold text-indigo-600 dark:text-indigo-400">
+                      {stat.formattedHours}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-slate-600 dark:text-slate-400">
+                      {stat.decimalHours} hrs
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-600 dark:text-slate-400">
+                      {stat.screenshotsCount}
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                        stat.isToday
+                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                          : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                      }`}>
+                        {stat.isToday ? 'Active Shift' : 'Completed'}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right">
+                      <button
+                        onClick={() => {
+                          setSelectedDate(stat.dateKey);
+                          setSelectedHourTab('all');
+                        }}
+                        className="text-xs text-indigo-600 hover:text-indigo-700 font-semibold cursor-pointer"
+                      >
+                        View Screenshots &rarr;
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Hour-Wise Filter Tabs & Gallery */}
@@ -1209,7 +1589,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-bold text-slate-900 dark:text-white">
-              My Hourly Screenshot History (Today)
+              My Hourly Screenshot History ({selectedDate === getTodayDateKey() ? 'Today' : selectedDate})
             </h2>
             <p className="text-xs text-slate-500">
               Random captures (5–10 min intervals) automatically funneled to Admin Drive
@@ -1226,7 +1606,7 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
               }`}
             >
-              All Hours ({userScreenshots.length})
+              All Hours ({dateScreenshots.length})
             </button>
             {availableHours.map((hr) => (
               <button
@@ -1266,15 +1646,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   onClick={() => setPreviewModal(screen)}
                   className="relative cursor-pointer bg-slate-950 aspect-video group overflow-hidden"
                 >
-                  <img
-                    src={screen.previewDataUrl}
+                  <ScreenshotViewerImage
+                    screen={screen}
                     alt={screen.taskName}
-                    className="w-full h-full object-cover group-hover:scale-105 transition duration-200"
+                    className="group-hover:scale-105 transition duration-200"
                   />
-                  <div className="absolute top-2 right-2 bg-black/70 text-white text-[10px] font-mono px-2 py-0.5 rounded">
+                  <div className="absolute top-2 right-2 bg-black/75 backdrop-blur-xs text-white text-[10px] font-mono px-2 py-0.5 rounded shadow pointer-events-none">
                     .{screen.fileFormat}
                   </div>
-                  <div className="absolute bottom-2 left-2 bg-black/70 text-white text-[10px] font-medium px-2 py-0.5 rounded">
+                  <div className="absolute bottom-2 left-2 bg-black/75 backdrop-blur-xs text-white text-[10px] font-medium px-2 py-0.5 rounded shadow pointer-events-none">
                     {screen.timeFormatted}
                   </div>
                 </div>
@@ -1358,11 +1738,12 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                 Close ✕
               </button>
             </div>
-            <div className="p-4 bg-slate-950 flex items-center justify-center max-h-[70vh] overflow-auto">
-              <img
-                src={previewModal.previewDataUrl}
+            <div className="p-4 bg-slate-950 flex items-center justify-center min-h-[320px] max-h-[70vh] overflow-auto">
+              <ScreenshotViewerImage
+                screen={previewModal}
                 alt={previewModal.taskName}
-                className="max-h-[65vh] w-auto object-contain rounded"
+                isModal={true}
+                className="max-h-[65vh] w-auto"
               />
             </div>
             <div className="p-3 bg-slate-50 dark:bg-slate-800 text-xs text-slate-600 dark:text-slate-300 flex items-center justify-between">
@@ -1392,10 +1773,10 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               onClick={() => setPreviewModal(activeCaptureNotice)}
               title="Click to expand screenshot preview"
             >
-              <img
-                src={activeCaptureNotice.previewDataUrl}
+              <ScreenshotViewerImage
+                screen={activeCaptureNotice}
                 alt="Capture preview"
-                className="w-full h-full object-cover transition duration-300 group-hover:scale-110"
+                className="w-full h-full transition duration-300 group-hover:scale-110"
               />
               <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition flex items-center justify-center">
                 <Camera className="w-4 h-4 text-white drop-shadow" />
@@ -1742,6 +2123,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
           </div>
         </div>
       )}
+      {/* Off-screen video element keeping screen stream composited & active */}
+      <video
+        ref={screenVideoRef}
+        autoPlay
+        muted
+        playsInline
+        className="fixed -top-[9999px] -left-[9999px] w-[320px] h-[180px] opacity-[0.001] pointer-events-none"
+      />
     </div>
   );
 };

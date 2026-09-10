@@ -50,6 +50,7 @@ export const DEFAULT_STORAGE_SETTINGS: StorageSettings = {
   allowedIntervals: [10, 20, 60, 300, 600, 900],
   lockIntervalForEmployees: true,
   spreadsheetName: 'Employee_Time_Tracking_Master',
+  showWorkspaceDiagnostics: false,
 };
 
 export function getStoredUsers(): AppUser[] {

@@ -318,11 +318,14 @@ export function subscribeToScreenshots(callback: (screenshots: ScreenshotLog[]) 
 export async function logScreenshotToFirestore(screen: ScreenshotLog) {
   if (!db) return;
   try {
-    // Only store thumbnail/preview if small, plus Google Drive links
     const record = { ...screen };
-    // If previewDataUrl is heavy base64, keep it clipped for database efficiency while Drive has the full raw image
-    if (record.previewDataUrl && record.previewDataUrl.length > 50000) {
-      record.previewDataUrl = record.previewDataUrl.slice(0, 50000);
+    // Never slice base64 strings! Slicing cuts off image bytes and corrupts rendering into broken black boxes.
+    // The screen's previewDataUrl is generated via generateThumbnailDataUrl (~15-25KB), which safely fits Firestore.
+    // If an oversized string (>350KB) is passed, clear it only if Drive link exists, rather than corrupting the data.
+    if (record.previewDataUrl && record.previewDataUrl.length > 350000) {
+      if (record.driveThumbnailLink || record.driveFileId) {
+        record.previewDataUrl = '';
+      }
     }
     await withTimeout(setDoc(doc(db, 'screenshots', screen.id), record), 3500);
   } catch (e) {

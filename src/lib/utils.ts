@@ -81,3 +81,43 @@ export async function canvasToBlob(
     );
   });
 }
+
+/**
+ * Generates a crisp, lightweight downscaled thumbnail Data URL (~15-25KB)
+ * for instant UI preview and cloud synchronization with high visibility.
+ * Prevents payload bloat and prevents string truncation issues.
+ */
+export function generateThumbnailDataUrl(
+  sourceCanvas: HTMLCanvasElement,
+  maxWidth = 640,
+  maxHeight = 360,
+  quality = 0.75
+): string {
+  const srcWidth = sourceCanvas.width || 1920;
+  const srcHeight = sourceCanvas.height || 1080;
+
+  let targetWidth = maxWidth;
+  let targetHeight = Math.round((srcHeight / srcWidth) * maxWidth);
+
+  if (targetHeight > maxHeight) {
+    targetHeight = maxHeight;
+    targetWidth = Math.round((srcWidth / srcHeight) * maxHeight);
+  }
+
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.width = targetWidth;
+  thumbCanvas.height = targetHeight;
+  const ctx = thumbCanvas.getContext('2d');
+  if (ctx) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(sourceCanvas, 0, 0, targetWidth, targetHeight);
+  }
+
+  try {
+    return thumbCanvas.toDataURL('image/webp', quality);
+  } catch {
+    return thumbCanvas.toDataURL('image/jpeg', quality);
+  }
+}
+
