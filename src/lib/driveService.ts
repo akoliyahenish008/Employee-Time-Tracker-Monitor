@@ -139,3 +139,55 @@ export async function resolveEmployeeDateFolder(
 
   return { rootFolderId, userFolderId, dateFolderId };
 }
+
+/**
+ * Permanently deletes a file or folder from Google Drive
+ */
+export async function deleteDriveFileOrFolder(accessToken: string, fileId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    return res.ok || res.status === 404;
+  } catch (err) {
+    console.warn(`Failed to delete Drive file/folder ${fileId}:`, err);
+    return false;
+  }
+}
+
+/**
+ * Finds and deletes the employee's main folder and all contained screenshots from Google Drive
+ */
+export async function deleteEmployeeDriveFolder(
+  accessToken: string,
+  rootParentId: string | undefined,
+  userName: string
+): Promise<boolean> {
+  try {
+    const sanitizedUserName = userName.trim().replace(/[/\\?%*:|"<>]/g, '_') || 'Employee';
+    let query = `name = '${sanitizedUserName.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+    if (rootParentId) {
+      query += ` and '${rootParentId}' in parents`;
+    }
+
+    const searchUrl = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id, name)&spaces=drive`;
+    const searchRes = await fetch(searchUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!searchRes.ok) return false;
+    const searchData = await searchRes.json();
+    if (searchData.files && searchData.files.length > 0) {
+      for (const folder of searchData.files) {
+        await deleteDriveFileOrFolder(accessToken, folder.id);
+      }
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.warn(`Error deleting employee Drive folder for ${userName}:`, e);
+    return false;
+  }
+}
+

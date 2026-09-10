@@ -22,7 +22,15 @@ import {
   BellRing,
   Volume2,
   VolumeX,
-  X
+  X,
+  Info,
+  HelpCircle,
+  Terminal,
+  Lock,
+  KeyRound,
+  Eye,
+  EyeOff,
+  RotateCcw
 } from 'lucide-react';
 import {
   formatSecondsToHoursMinutes,
@@ -41,9 +49,11 @@ import {
   logTaskIntervalToSheet,
   ensureSheetTab,
   appendSheetRows,
+  updateUserPasswordInSheet,
 } from '../lib/sheetService';
 import { provisionEmployeeWorkspace } from '../lib/workspaceProvisioner';
-import { logScreenshotToFirestore } from '../lib/firebase';
+import { logScreenshotToFirestore, syncUserToFirestore } from '../lib/firebase';
+import { getStoredUsers, saveStoredUsers } from '../lib/userStore';
 
 interface EmployeeDashboardProps {
   currentUser: AppUser;
@@ -98,6 +108,137 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
     );
   });
   const [showNotificationSettings, setShowNotificationSettings] = useState<boolean>(false);
+  const [showHidePopupTip, setShowHidePopupTip] = useState<boolean>(false);
+  const [showSilentGuideModal, setShowSilentGuideModal] = useState<boolean>(false);
+
+  // Employee Password Management Modal State
+  const [showPasswordModal, setShowPasswordModal] = useState<boolean>(false);
+  const [passwordModalTab, setPasswordModalTab] = useState<'change' | 'reset'>('change');
+  const [oldPasswordInput, setOldPasswordInput] = useState<string>('');
+  const [newPasswordInput, setNewPasswordInput] = useState<string>('');
+  const [confirmPasswordInput, setConfirmPasswordInput] = useState<string>('');
+  const [passwordStatusMsg, setPasswordStatusMsg] = useState<string>('');
+  const [passwordErrorMsg, setPasswordErrorMsg] = useState<string>('');
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState<boolean>(false);
+  const [showOldPw, setShowOldPw] = useState<boolean>(false);
+  const [showNewPw, setShowNewPw] = useState<boolean>(false);
+
+  // Sync selected interval if storageSettings changes
+  useEffect(() => {
+    if (storageSettings.captureMode === 'random_5_to_10_min') {
+      setSelectedInterval('random');
+    } else if (storageSettings.captureIntervalSeconds) {
+      setSelectedInterval(storageSettings.captureIntervalSeconds);
+    }
+  }, [storageSettings.captureMode, storageSettings.captureIntervalSeconds]);
+
+  // Employee Password Change Handler
+  const handleChangePasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPasswordStatusMsg('');
+    setPasswordErrorMsg('');
+
+    const currentActualPassword = currentUser.password || 'admin123';
+    if (oldPasswordInput !== currentActualPassword) {
+      setPasswordErrorMsg('Current password does not match. If you forgot your password, use the "Reset to Default" tab.');
+      return;
+    }
+
+    if (newPasswordInput.length < 4) {
+      setPasswordErrorMsg('New password must be at least 4 characters.');
+      return;
+    }
+
+    if (newPasswordInput !== confirmPasswordInput) {
+      setPasswordErrorMsg('New password and confirmation do not match.');
+      return;
+    }
+
+    setIsUpdatingPassword(true);
+    try {
+      const updatedUser: AppUser = {
+        ...currentUser,
+        password: newPasswordInput,
+        lastActive: new Date().toISOString(),
+      };
+
+      // 1. Update local users store
+      const allUsers = getStoredUsers();
+      const updatedList = allUsers.map((u) => (u.id === currentUser.id ? updatedUser : u));
+      saveStoredUsers(updatedList);
+
+      // 2. Sync to Firestore
+      await syncUserToFirestore(updatedUser);
+
+      // 3. Update in Google Sheet Employee_Credentials tab
+      const token = effectiveDriveToken;
+      if (token) {
+        try {
+          const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+          await updateUserPasswordInSheet(token, spreadsheetId, updatedUser);
+        } catch (sheetErr) {
+          console.warn('Google Sheet password sync note:', sheetErr);
+        }
+      }
+
+      setPasswordStatusMsg('✅ Password successfully changed and recorded in Google Sheet!');
+      setOldPasswordInput('');
+      setNewPasswordInput('');
+      setConfirmPasswordInput('');
+      setTimeout(() => {
+        setShowPasswordModal(false);
+        setPasswordStatusMsg('');
+      }, 2500);
+    } catch (err: any) {
+      setPasswordErrorMsg(`Failed to update password: ${err.message}`);
+    } finally {
+      setIsUpdatingPassword(false);
+    }
+  };
+
+  // Employee Password Reset Handler (resets to "admin123")
+  const handleResetToDefaultPassword = async () => {
+    setPasswordStatusMsg('');
+    setPasswordErrorMsg('');
+    setIsUpdatingPassword(true);
+
+    try {
+      const updatedUser: AppUser = {
+        ...currentUser,
+        password: 'admin123',
+        lastActive: new Date().toISOString(),
+      };
+
+      // 1. Update local users store
+      const allUsers = getStoredUsers();
+      const updatedList = allUsers.map((u) => (u.id === currentUser.id ? updatedUser : u));
+      saveStoredUsers(updatedList);
+
+      // 2. Sync to Firestore
+      await syncUserToFirestore(updatedUser);
+
+      // 3. Update in Google Sheet Employee_Credentials tab
+      const token = effectiveDriveToken;
+      if (token) {
+        try {
+          const spreadsheetId = await getOrCreateSpreadsheet(token, storageSettings.spreadsheetName);
+          await updateUserPasswordInSheet(token, spreadsheetId, updatedUser);
+        } catch (sheetErr) {
+          console.warn('Google Sheet password sync note:', sheetErr);
+        }
+      }
+
+      setPasswordStatusMsg('✅ Password has been reset to: admin123 and updated in Google Sheet!');
+      setTimeout(() => {
+        setShowPasswordModal(false);
+        setPasswordStatusMsg('');
+      }, 2500);
+    } catch (err: any) {
+      setPasswordErrorMsg(`Failed to reset password: ${err.message}`);
+    } finally {
+      setIsUpdatingPassword(false);
+    }
+  };
 
   // Audio synthesis chime for subtle audio feedback when screenshot is taken
   const playCaptureChime = () => {
@@ -275,25 +416,57 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
   }, []);
 
   // Request actual entire computer screen capture using getDisplayMedia
+  // Pre-selects Entire Screen ("monitor") and excludes Chrome Tab & Window options
   const initScreenStream = async (): Promise<MediaStream | null> => {
     try {
       if (screenStreamRef.current && screenStreamRef.current.active) {
         return screenStreamRef.current;
       }
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          displaySurface: 'monitor', // request entire monitor
-        },
-        audio: false,
-      });
+
+      let stream: MediaStream;
+      try {
+        // Enforce Entire Screen ("monitor") and exclude Chrome Tab & Window options
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'monitor', // Pre-select Entire Screen tab
+            width: { ideal: 1920, max: 3840 },
+            height: { ideal: 1080, max: 2160 },
+            frameRate: { ideal: 5, max: 15 },
+          },
+          audio: false,
+          monitorTypeSurfaces: 'include', // Include physical screens
+          selfBrowserSurface: 'exclude',   // Exclude "Chrome Tab"
+          surfaceSwitching: 'exclude',     // Exclude dynamic switching
+          systemAudio: 'exclude',
+          preferCurrentTab: false,
+        } as any);
+      } catch (advancedErr) {
+        console.warn('Advanced display constraints fallback:', advancedErr);
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: 'monitor',
+          },
+          audio: false,
+        });
+      }
 
       // Handle user stopping screen share from browser banner
-      stream.getVideoTracks()[0].onended = () => {
-        setLastSyncStatus('Screen sharing stopped by user');
-        screenStreamRef.current = null;
-      };
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        // Warn if non-monitor surface was selected
+        const settings = videoTrack.getSettings ? (videoTrack.getSettings() as any) : null;
+        if (settings?.displaySurface && settings.displaySurface !== 'monitor') {
+          setLastSyncStatus('⚠️ Notice: You selected a single window/tab. For full monitoring, choose "Entire Screen".');
+        }
+
+        videoTrack.onended = () => {
+          setLastSyncStatus('Screen sharing stopped. Click "Resume" to restart whole-screen tracking.');
+          screenStreamRef.current = null;
+        };
+      }
 
       screenStreamRef.current = stream;
+      setShowHidePopupTip(true);
       return stream;
     } catch (err: any) {
       console.error('Screen capture permission error:', err);
@@ -743,32 +916,56 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               </div>
             </div>
 
-            {/* Live Sync Status Banner & Interval Selector */}
+            {/* Live Sync Status Banner & Interval Selector / Locked Policy Display */}
             <div className="space-y-2 pt-1">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Capture Interval:</span>
-                {[
-                  { label: '10 sec', val: 10 },
-                  { label: '20 sec', val: 20 },
-                  { label: '1 min', val: 60 },
-                  { label: '5 min', val: 300 },
-                  { label: '10 min', val: 600 },
-                  { label: '15 min', val: 900 },
-                  { label: 'Random (5–10m)', val: 'random' },
-                ].map((item) => (
-                  <button
-                    key={item.label}
-                    type="button"
-                    onClick={() => handleIntervalChange(item.val as any)}
-                    className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition cursor-pointer ${
-                      selectedInterval === item.val
-                        ? 'bg-indigo-600 text-white shadow-sm'
-                        : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
-                    }`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
+                <span className="text-xs font-bold text-slate-700 dark:text-slate-300">Capture Frequency:</span>
+                {storageSettings.lockIntervalForEmployees !== false ? (
+                  <span className="inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-semibold border border-slate-200 dark:border-slate-700">
+                    <Lock className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
+                    <span>
+                      {selectedInterval === 'random'
+                        ? 'Random (5–10 min intervals)'
+                        : `${selectedInterval} seconds interval`}
+                    </span>
+                    <span className="text-[10px] bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 font-bold px-1.5 py-0.5 rounded">
+                      Enforced by Admin Policy
+                    </span>
+                  </span>
+                ) : (
+                  // If unlocked, only show the interval options permitted in storageSettings.allowedIntervals
+                  [
+                    { label: '10 sec', val: 10 },
+                    { label: '20 sec', val: 20 },
+                    { label: '30 sec', val: 30 },
+                    { label: '1 min', val: 60 },
+                    { label: '2 min', val: 120 },
+                    { label: '5 min', val: 300 },
+                    { label: '10 min', val: 600 },
+                    { label: '15 min', val: 900 },
+                    { label: '30 min', val: 1800 },
+                    { label: 'Random (5–10m)', val: 'random' },
+                  ]
+                    .filter((item) => {
+                      if (!storageSettings.allowedIntervals || storageSettings.allowedIntervals.length === 0) return true;
+                      if (item.val === 'random') return storageSettings.allowedIntervals.includes(420);
+                      return storageSettings.allowedIntervals.includes(item.val);
+                    })
+                    .map((item) => (
+                      <button
+                        key={item.label}
+                        type="button"
+                        onClick={() => handleIntervalChange(item.val as any)}
+                        className={`px-2.5 py-1 text-xs font-semibold rounded-lg transition cursor-pointer ${
+                          selectedInterval === item.val
+                            ? 'bg-indigo-600 text-white shadow-sm'
+                            : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))
+                )}
               </div>
 
               <div className="text-xs text-slate-500 flex flex-wrap items-center gap-2">
@@ -953,6 +1150,20 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
 
               <button
                 type="button"
+                onClick={() => {
+                  setShowPasswordModal(true);
+                  setPasswordStatusMsg('');
+                  setPasswordErrorMsg('');
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold shadow-xs transition cursor-pointer"
+                title="Change password or reset to admin123"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-amber-500" />
+                <span>Password Settings</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => handleProvisionWorkspace(true)}
                 disabled={isProvisioning}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
@@ -969,6 +1180,27 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
               <span>{workspaceStatus}</span>
             </div>
           )}
+
+          {/* Whole Screen Active Guidance & Stop Sharing Removal Guide */}
+          <div className="p-3 bg-indigo-50/80 dark:bg-indigo-950/50 border border-indigo-200 dark:border-indigo-800 rounded-xl text-xs flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2 text-indigo-900 dark:text-indigo-200">
+              <Monitor className="w-4 h-4 text-indigo-600 dark:text-indigo-400 shrink-0" />
+              <span>
+                <strong>Whole-Screen Capture:</strong> To hide the Chrome <em>"sharing your screen"</em> popup bar, click the <strong>[Hide]</strong> button right next to "Stop sharing".
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-sm transition cursor-pointer"
+              >
+                <Terminal className="w-3.5 h-3.5" />
+                <span>Remove Popups & Silent PC Setup</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1199,6 +1431,313 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                   View Full Size
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Silent Enterprise Setup & Remove Popups Guide Modal */}
+      {showSilentGuideModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4 backdrop-blur-sm animate-in fade-in">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-800/60">
+              <div className="flex items-center gap-2">
+                <div className="p-2 bg-indigo-100 dark:bg-indigo-900/60 text-indigo-600 dark:text-indigo-300 rounded-xl">
+                  <Terminal className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Silent Whole-Screen Mode & Remove Popups
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    How to remove the "Stop sharing" popup and bypass tab/window pickers
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1.5 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 max-h-[75vh] overflow-y-auto text-xs text-slate-600 dark:text-slate-300">
+              {/* Method 1 */}
+              <div className="p-4 rounded-xl border border-emerald-200 dark:border-emerald-800/60 bg-emerald-50/50 dark:bg-emerald-950/30 space-y-2">
+                <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-bold text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span>Instant 1-Click Method (No Installation Needed)</span>
+                </div>
+                <p className="leading-relaxed">
+                  When Chrome displays the bottom bar saying <em>"...is sharing your screen. [Stop sharing] [Hide]"</em>:
+                </p>
+                <div className="bg-white dark:bg-slate-900 p-3 rounded-lg border border-emerald-200 dark:border-emerald-800 flex items-center justify-between">
+                  <span className="font-medium text-slate-800 dark:text-slate-200">
+                    Click the <strong>[Hide]</strong> button right next to Stop Sharing.
+                  </span>
+                  <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 rounded font-bold text-[11px]">
+                    Hides Bar Instantly
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Chrome will immediately minimize the bar off the screen while maintaining continuous background screenshot captures.
+                </p>
+              </div>
+
+              {/* Method 2 */}
+              <div className="p-4 rounded-xl border border-indigo-200 dark:border-indigo-800/60 bg-indigo-50/50 dark:bg-indigo-950/30 space-y-3">
+                <div className="flex items-center gap-2 text-indigo-800 dark:text-indigo-300 font-bold text-sm">
+                  <Monitor className="w-4 h-4 text-indigo-600" />
+                  <span>Corporate Silent Mode (Bypasses Picker Dialog & Removes Popup Completely)</span>
+                </div>
+                <p className="leading-relaxed">
+                  For employee PCs and office workstations where employee monitoring is mandated, you can launch Chrome in Enterprise Silent Mode. This completely skips the picker dialog (no tabs/windows) and completely suppresses the "stop sharing" bar:
+                </p>
+
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">
+                    Windows Run Shortcut (or Startup Batch):
+                  </div>
+                  <div className="p-2.5 bg-slate-950 text-emerald-400 font-mono text-[11px] rounded-lg overflow-x-auto select-all">
+                    chrome.exe --auto-select-desktop-capture-source="Entire screen" --enable-usermedia-screen-capturing --app="{window.location.href}"
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-200">
+                    Google Chrome Enterprise Policy (GPO / Registry for All Office PCs):
+                  </div>
+                  <div className="p-2.5 bg-slate-950 text-slate-200 font-mono text-[11px] rounded-lg overflow-x-auto">
+                    Registry Path: HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome<br />
+                    Value Name: AutoSelectDesktopCaptureSource<br />
+                    Value Data (JSON String): ["Entire screen"]
+                  </div>
+                </div>
+
+                <ul className="list-disc pl-5 space-y-1 text-[11px] text-slate-500">
+                  <li><strong>Zero Dialogs:</strong> Never shows "Chrome Tab" or "Window" options.</li>
+                  <li><strong>Zero Popups:</strong> Removes the "Stop sharing" warning completely.</li>
+                  <li><strong>100% Background:</strong> Captures the full desktop seamlessly for central Admin sync.</li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/60 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowSilentGuideModal(false)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-xl text-xs transition cursor-pointer"
+              >
+                Got It, Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Employee Password Change / Reset Modal */}
+      {showPasswordModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden flex flex-col">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-800/60">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 rounded-xl">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Password Management
+                  </h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Manage login security for {currentUser.name}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPasswordModal(false);
+                  setPasswordStatusMsg('');
+                  setPasswordErrorMsg('');
+                }}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1.5 rounded-lg text-sm cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Tabs */}
+            <div className="flex border-b border-slate-200 dark:border-slate-800 bg-slate-100/50 dark:bg-slate-800/40">
+              <button
+                type="button"
+                onClick={() => {
+                  setPasswordModalTab('change');
+                  setPasswordStatusMsg('');
+                  setPasswordErrorMsg('');
+                }}
+                className={`flex-1 py-2.5 text-xs font-bold transition cursor-pointer text-center ${
+                  passwordModalTab === 'change'
+                    ? 'border-b-2 border-indigo-600 text-indigo-600 dark:text-indigo-400 bg-white dark:bg-slate-900'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Change Password
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPasswordModalTab('reset');
+                  setPasswordStatusMsg('');
+                  setPasswordErrorMsg('');
+                }}
+                className={`flex-1 py-2.5 text-xs font-bold transition cursor-pointer text-center ${
+                  passwordModalTab === 'reset'
+                    ? 'border-b-2 border-indigo-600 text-indigo-600 dark:text-indigo-400 bg-white dark:bg-slate-900'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Reset to Default
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {/* Feedback messages */}
+              {passwordStatusMsg && (
+                <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 rounded-xl text-xs font-semibold flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{passwordStatusMsg}</span>
+                </div>
+              )}
+
+              {passwordErrorMsg && (
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-300 rounded-xl text-xs font-medium flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{passwordErrorMsg}</span>
+                </div>
+              )}
+
+              {passwordModalTab === 'change' ? (
+                <form onSubmit={handleChangePasswordSubmit} className="space-y-3.5">
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Current Password
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showOldPw ? 'text' : 'password'}
+                        value={oldPasswordInput}
+                        onChange={(e) => setOldPasswordInput(e.target.value)}
+                        required
+                        placeholder="Enter your current password"
+                        className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-xl px-3 py-2.5 pr-10 text-slate-800 dark:text-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowOldPw(!showOldPw)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showOldPw ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      New Password
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showNewPw ? 'text' : 'password'}
+                        value={newPasswordInput}
+                        onChange={(e) => setNewPasswordInput(e.target.value)}
+                        required
+                        minLength={4}
+                        placeholder="Enter new password (min 4 chars)"
+                        className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-xl px-3 py-2.5 pr-10 text-slate-800 dark:text-white"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowNewPw(!showNewPw)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        {showNewPw ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                      Confirm New Password
+                    </label>
+                    <input
+                      type="password"
+                      value={confirmPasswordInput}
+                      onChange={(e) => setConfirmPasswordInput(e.target.value)}
+                      required
+                      placeholder="Re-type new password"
+                      className="w-full text-xs border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 rounded-xl px-3 py-2.5 text-slate-800 dark:text-white"
+                    />
+                  </div>
+
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    💡 When updated, your new password is automatically updated in the organization Google Sheet (<code className="font-mono text-indigo-600">Employee_Credentials</code>).
+                  </p>
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowPasswordModal(false)}
+                      className="px-3 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={isUpdatingPassword}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer disabled:opacity-50"
+                    >
+                      {isUpdatingPassword ? 'Updating & Syncing...' : 'Update Password'}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="space-y-4">
+                  <div className="p-3.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-xl space-y-1 text-xs">
+                    <div className="font-bold text-amber-900 dark:text-amber-200 flex items-center gap-1.5">
+                      <Info className="w-4 h-4 text-amber-600 shrink-0" />
+                      <span>Forgot your password?</span>
+                    </div>
+                    <p className="text-amber-800 dark:text-amber-300 text-[11px] leading-relaxed">
+                      If you cannot remember your current password, you can reset it to the default system password: <strong className="font-mono bg-white dark:bg-slate-900 px-1.5 py-0.5 rounded border border-amber-300">admin123</strong>.
+                    </p>
+                    <p className="text-amber-800 dark:text-amber-300 text-[11px]">
+                      This reset will automatically sync to your Google Sheet credentials list immediately.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowPasswordModal(false)}
+                      className="px-3 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleResetToDefaultPassword}
+                      disabled={isUpdatingPassword}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-xl transition cursor-pointer disabled:opacity-50"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>{isUpdatingPassword ? 'Resetting...' : 'Reset Password to "admin123"'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
