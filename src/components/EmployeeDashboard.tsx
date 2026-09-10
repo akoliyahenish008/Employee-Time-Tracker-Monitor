@@ -1060,14 +1060,14 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
         {/* Central Storage Destination Bar & Workspace Verification */}
         <div className="mt-4 pt-4 border-t border-slate-100 dark:border-slate-800 space-y-2.5 text-xs">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
-              <Monitor className="w-4 h-4 text-indigo-500" />
-              <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
-              <span>&bull;</span>
-              <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
-              <span>&bull;</span>
-              <span>Sheet Tab: <strong className="font-mono text-slate-800 dark:text-slate-200">[{currentUser.name}]</strong> in <strong className="text-slate-800 dark:text-slate-200">{storageSettings.spreadsheetName}</strong></span>
-            </div>
+            // <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400">
+            //   <Monitor className="w-4 h-4 text-indigo-500" />
+            //   <span>Target Drive: <strong className="text-slate-800 dark:text-slate-200">{storageSettings.centralAdminEmail}</strong></span>
+            //   <span>&bull;</span>
+            //   <span>Folder: <strong className="font-mono text-slate-800 dark:text-slate-200">/{storageSettings.centralFolderName}/{currentUser.name}/{getTodayDateKey()}/</strong></span>
+            //   <span>&bull;</span>
+            //   <span>Sheet Tab: <strong className="font-mono text-slate-800 dark:text-slate-200">[{currentUser.name}]</strong> in <strong className="text-slate-800 dark:text-slate-200">{storageSettings.spreadsheetName}</strong></span>
+            // </div>
 
             <div className="flex items-center gap-2">
               {/* Notification Preferences Popover Button */}
@@ -1162,15 +1162,15 @@ export const EmployeeDashboard: React.FC<EmployeeDashboardProps> = ({
                 <span>Password Settings</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => handleProvisionWorkspace(true)}
-                disabled={isProvisioning}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
-              >
-                <HardDrive className="w-3.5 h-3.5 text-indigo-500" />
-                <span>{isProvisioning ? 'Verifying...' : 'Check / Create Drive Folder & Sheet Tab'}</span>
-              </button>
+              // <button
+              //   type="button"
+              //   onClick={() => handleProvisionWorkspace(true)}
+              //   disabled={isProvisioning}
+              //   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 text-slate-700 dark:text-slate-200 font-semibold transition cursor-pointer disabled:opacity-50"
+              // >
+              //   <HardDrive className="w-3.5 h-3.5 text-indigo-500" />
+              //   <span>{isProvisioning ? 'Verifying...' : 'Check / Create Drive Folder & Sheet Tab'}</span>
+              // </button>
             </div>
           </div>
 
