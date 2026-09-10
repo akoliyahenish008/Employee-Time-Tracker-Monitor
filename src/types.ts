@@ -74,8 +74,6 @@ export interface StorageSettings {
   autoCaptureIntervalMinutes: number; // base fallback
   captureIntervalSeconds: number; // 10, 20, 60, 300, 600, 900, or random
   captureMode: 'random_5_to_10_min' | 'fixed_interval';
-  allowedIntervals?: number[]; // Admin-selected available duration options in seconds
-  lockIntervalForEmployees?: boolean; // When true (default), employees cannot modify capture interval
   adminAccessToken?: string; // Shared central Admin Google OAuth Token stored in cloud settings
   adminTokenExpiry?: string;
   googleSpreadsheetId?: string;

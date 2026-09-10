@@ -353,7 +353,6 @@ export default function App() {
               saveStorageSettingsToFirestore(s);
             }}
             allScreenshots={screenshots}
-            onUpdateScreenshots={setScreenshots}
             accessToken={googleAccessToken}
             onConnectDrive={handleConnectGoogle}
           />

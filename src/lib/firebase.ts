@@ -22,8 +22,6 @@ import {
   limit,
   deleteDoc,
   getDocFromServer,
-  where,
-  getDocs,
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { AppUser, PendingSignup, StorageSettings, ScreenshotLog } from '../types';
@@ -329,25 +327,3 @@ export async function logScreenshotToFirestore(screen: ScreenshotLog) {
     console.warn('Failed to log screenshot to Firestore:', e);
   }
 }
-
-export async function deleteUserFromFirestore(userId: string) {
-  if (!db) return;
-  try {
-    await withTimeout(deleteDoc(doc(db, 'users', userId)), 4000);
-  } catch (e) {
-    console.warn('Failed to delete user from Firestore:', e);
-  }
-}
-
-export async function deleteScreenshotsForUserFromFirestore(userId: string) {
-  if (!db) return;
-  try {
-    const q = query(collection(db, 'screenshots'), where('userId', '==', userId));
-    const snap = await withTimeout(getDocs(q), 5000);
-    const deletePromises = snap.docs.map((d) => deleteDoc(d.ref));
-    await Promise.all(deletePromises);
-  } catch (e) {
-    console.warn('Failed to delete user screenshots from Firestore:', e);
-  }
-}
-

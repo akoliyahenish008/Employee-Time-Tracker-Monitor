@@ -24,7 +24,7 @@ service cloud.firestore {
       allow read: if true;
       allow create: if true;
       allow update: if true;
-      allow delete: if true;
+      allow delete: if isAdmin();
     }
 
     // Pending Signups: Created by employees during signup, read and confirmed by admin or the user
@@ -40,7 +40,7 @@ service cloud.firestore {
       allow read: if true;
       allow create: if true;
       allow update: if true;
-      allow delete: if true;
+      allow delete: if isAdmin();
     }
 
     // Screenshots: Screen capture records with Google Drive file links
@@ -48,7 +48,7 @@ service cloud.firestore {
       allow read: if true;
       allow create: if true;
       allow update: if true;
-      allow delete: if true;
+      allow delete: if isAdmin();
     }
 
     // Settings: Global storage configuration

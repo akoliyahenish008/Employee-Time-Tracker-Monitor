@@ -9,14 +9,8 @@
  * 6. Employee-specific Tab: [Employee Name] with all tracking header columns
  */
 
-import { getOrCreateFolder, deleteEmployeeDriveFolder } from './driveService';
-import {
-  getOrCreateSpreadsheet,
-  ensureSheetTab,
-  logEmployeeRegistrationToSheet,
-  updateUserPasswordInSheet,
-  deleteEmployeeSheetTab,
-} from './sheetService';
+import { getOrCreateFolder } from './driveService';
+import { getOrCreateSpreadsheet, ensureSheetTab, logEmployeeRegistrationToSheet } from './sheetService';
 import { getTodayDateKey } from './utils';
 import { AppUser } from '../types';
 
@@ -104,13 +98,6 @@ export async function provisionEmployeeWorkspace(
     // 6. Google Sheets: Ensure Employee's dedicated Tab exists with formatted tracking headers
     await ensureSheetTab(accessToken, spreadsheetId, sanitizedName);
 
-    // 7. Google Sheets: Ensure credentials tab contains the employee's active password
-    try {
-      await updateUserPasswordInSheet(accessToken, spreadsheetId, employee);
-    } catch (passErr) {
-      console.warn('Password sheet sync note:', passErr);
-    }
-
     return {
       success: true,
       message: `Successfully provisioned Google Drive folder and Sheet tab for ${employee.name}!`,
@@ -129,36 +116,3 @@ export async function provisionEmployeeWorkspace(
     };
   }
 }
-
-/**
- * Deprovisions / deletes an employee's folder in Google Drive and tab in Google Sheets
- */
-export async function deprovisionEmployeeWorkspace(
-  accessToken: string,
-  employee: AppUser,
-  spreadsheetTitle: string = 'Employee_Time_Tracking_Master',
-  rootFolderName: string = 'WorkMonitor_Records'
-): Promise<{ driveDeleted: boolean; sheetDeleted: boolean }> {
-  let driveDeleted = false;
-  let sheetDeleted = false;
-
-  if (!accessToken) return { driveDeleted, sheetDeleted };
-
-  try {
-    // 1. Delete Google Drive Folder for the user
-    driveDeleted = await deleteEmployeeDriveFolder(accessToken, undefined, employee.name);
-  } catch (err) {
-    console.warn(`Drive folder deprovisioning error for ${employee.name}:`, err);
-  }
-
-  try {
-    // 2. Delete employee tab in Google Sheets
-    const spreadsheetId = await getOrCreateSpreadsheet(accessToken, spreadsheetTitle);
-    sheetDeleted = await deleteEmployeeSheetTab(accessToken, spreadsheetId, employee.name);
-  } catch (err) {
-    console.warn(`Sheet tab deprovisioning error for ${employee.name}:`, err);
-  }
-
-  return { driveDeleted, sheetDeleted };
-}
-

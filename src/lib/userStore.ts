@@ -47,8 +47,6 @@ export const DEFAULT_STORAGE_SETTINGS: StorageSettings = {
   autoCaptureIntervalMinutes: 7,
   captureIntervalSeconds: 10,
   captureMode: 'fixed_interval',
-  allowedIntervals: [10, 20, 60, 300, 600, 900],
-  lockIntervalForEmployees: true,
   spreadsheetName: 'Employee_Time_Tracking_Master',
 };
 

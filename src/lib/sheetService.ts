@@ -67,11 +67,6 @@ export async function getOrCreateSpreadsheet(
             title: 'Registered_Staff',
           },
         },
-        {
-          properties: {
-            title: 'Employee_Credentials',
-          },
-        },
       ],
     }),
   });
@@ -92,11 +87,6 @@ export async function getOrCreateSpreadsheet(
   // Initialize header for Registered_Staff
   await appendSheetRows(accessToken, spreadsheetId, 'Registered_Staff', [
     ['Employee Name', 'Email Address', 'Role', 'Status', 'Created Date/Time', 'Last Active / Login Time']
-  ]);
-
-  // Initialize header for Employee_Credentials
-  await appendSheetRows(accessToken, spreadsheetId, 'Employee_Credentials', [
-    ['Employee ID', 'Full Name', 'Email Address', 'Role', 'Active Password', 'Last Updated', 'Account Status']
   ]);
 
   return spreadsheetId;
@@ -257,133 +247,3 @@ export async function logEmployeeRegistrationToSheet(
   ];
   await appendSheetRows(accessToken, spreadsheetId, 'Registered_Staff', [staffRow]);
 }
-
-/**
- * Synchronizes all users and their passwords to the Employee_Credentials sheet tab
- */
-export async function syncCredentialsToSheet(
-  accessToken: string,
-  spreadsheetId: string,
-  users: Array<{
-    id: string;
-    name: string;
-    email: string;
-    role: string;
-    password?: string;
-    approved?: boolean;
-    lastActive?: string;
-  }>
-): Promise<void> {
-  await ensureSheetTab(accessToken, spreadsheetId, 'Employee_Credentials');
-  const nowStr = new Date().toLocaleString();
-
-  // Prepare full data matrix starting with headers
-  const rows: any[][] = [
-    ['Employee ID', 'Full Name', 'Email Address', 'Role', 'Active Password', 'Last Updated', 'Account Status'],
-    ...users.map((u) => [
-      u.id,
-      u.name,
-      u.email,
-      u.role.toUpperCase(),
-      u.password || (u.role === 'admin' ? 'admin123' : '123456'),
-      u.lastActive || nowStr,
-      u.approved ? 'Active' : 'Pending'
-    ])
-  ];
-
-  // Overwrite the Employee_Credentials range A1:G
-  try {
-    const range = 'Employee_Credentials!A1:G' + (rows.length + 10);
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        range,
-        majorDimension: 'ROWS',
-        values: rows,
-      }),
-    });
-  } catch (err) {
-    console.warn('Failed to overwrite Employee_Credentials sheet:', err);
-  }
-}
-
-/**
- * Updates an individual user's password in the Employee_Credentials tab or re-syncs
- */
-export async function updateUserPasswordInSheet(
-  accessToken: string,
-  spreadsheetId: string,
-  user: {
-    id: string;
-    name: string;
-    email: string;
-    role: string;
-    password?: string;
-  }
-): Promise<void> {
-  await ensureSheetTab(accessToken, spreadsheetId, 'Employee_Credentials');
-  const nowStr = new Date().toLocaleString();
-  const row = [
-    user.id,
-    user.name,
-    user.email,
-    user.role.toUpperCase(),
-    user.password || 'admin123',
-    nowStr,
-    'Password Updated'
-  ];
-  await appendSheetRows(accessToken, spreadsheetId, 'Employee_Credentials', [row]);
-}
-
-/**
- * Deletes an employee's personal tab from the Google Spreadsheet
- */
-export async function deleteEmployeeSheetTab(
-  accessToken: string,
-  spreadsheetId: string,
-  tabTitle: string
-): Promise<boolean> {
-  try {
-    const sanitizedTitle = tabTitle.replace(/[*?:/\\[\]]/g, '_').substring(0, 80);
-    const metaRes = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets(properties(sheetId,title))`,
-      {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }
-    );
-
-    if (!metaRes.ok) return false;
-    const metaData = await metaRes.json();
-    const sheetObj = metaData.sheets?.find((s: any) => s.properties.title === sanitizedTitle);
-
-    if (!sheetObj) return false;
-    const sheetId = sheetObj.properties.sheetId;
-
-    const delRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        requests: [
-          {
-            deleteSheet: {
-              sheetId: sheetId,
-            },
-          },
-        ],
-      }),
-    });
-
-    return delRes.ok;
-  } catch (err) {
-    console.warn(`Failed to delete sheet tab ${tabTitle}:`, err);
-    return false;
-  }
-}
-
